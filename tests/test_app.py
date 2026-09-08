@@ -16,5 +16,17 @@ def test_backtest_is_deterministic():
     second = client.post(f"/api/strategies/{created['strategy_id']}/backtest").json()["result"]
     assert first == second and first["trade_count"] >= 0
 
+def test_kill_switch_halts_excess_drawdown():
+    from app import Risk, kill_switch
+    risk = Risk(max_order_notional="100", max_position_notional="500", max_daily_loss="25", max_drawdown_percent="5", stop_loss_percent="2")
+    assert kill_switch("5.01", risk)["state"] == "HALTED"
+
+def test_monitoring_uses_immutable_baseline():
+    created = client.post("/api/strategies", json=STRATEGY).json()
+    backtest = client.post(f"/api/strategies/{created['strategy_id']}/backtest").json()
+    monitor = client.get(f"/api/strategies/{created['strategy_id']}/monitoring").json()
+    assert monitor["baseline"]["hash"] == backtest["checkpoint_hash"]
+    assert monitor["lifecycle"]["execution"] == "hard-blocked"
+
 def test_live_order_never_reaches_network():
     assert client.post("/api/orders", json={"strategy_id":"none","symbol":"SPY","side":"buy","quantity":"1","price":"100","mode":"live"}).status_code == 403

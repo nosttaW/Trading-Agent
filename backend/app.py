@@ -133,6 +133,10 @@ class BrokerAdapter:
     def unavailable(self): raise HTTPException(503, "Broker unavailable: configure the reviewed Alpaca adapter; simulated fills are prohibited.")
     get_account = get_clock = get_calendar = get_asset = get_positions = get_position = get_open_orders = get_order = get_order_by_client_order_id = submit_order = cancel_order = cancel_open_orders = stream_order_updates = stream_market_data = get_recent_bars = unavailable
 
+def kill_switch(maximum_drawdown_percent: str, risk: Risk) -> dict:
+    observed, limit = Decimal(maximum_drawdown_percent), money(risk.max_drawdown_percent)
+    return {"state":"HALTED" if observed > limit else "ARMED", "reason":"drawdown limit exceeded" if observed > limit else "drawdown within approved limit", "limit_percent":f"{limit:.2f}", "observed_percent":f"{observed:.2f}"}
+
 def metrics(strategy: Strategy, bars: list[dict]) -> dict:
     closes = [Decimal(b["close"]) for b in bars]
     fast, slow = strategy.entry.fast_period, strategy.entry.slow_period
@@ -155,11 +159,13 @@ def metrics(strategy: Strategy, bars: list[dict]) -> dict:
             fee = (shares * price * Decimal("0.0005")).quantize(Decimal("0.01")); cash += shares * price - fee; costs += fee; shares = Decimal("0"); position = False; trades += 1
     ending = cash + shares * closes[-1]
     max_dd = max((peak - v) / peak * 100 for v in curve) if curve else Decimal("0")
-    return {"starting_equity":"10000.00", "ending_equity":f"{ending:.2f}", "net_return_percent":f"{(ending / Decimal('10000') - 1) * 100:.2f}", "benchmark_return_percent":f"{(closes[-1] / closes[0] - 1) * 100:.2f}", "maximum_drawdown_percent":f"{max_dd:.2f}", "trade_count":trades, "costs":f"{costs:.2f}", "warnings":["Deterministic demo data only; not market data.", "Simplified close-price fill model; broker paper/live fills may differ.", "Trade count is insufficient for investment conclusions."]}
+    result = {"starting_equity":"10000.00", "ending_equity":f"{ending:.2f}", "net_return_percent":f"{(ending / Decimal('10000') - 1) * 100:.2f}", "benchmark_return_percent":f"{(closes[-1] / closes[0] - 1) * 100:.2f}", "maximum_drawdown_percent":f"{max_dd:.2f}", "trade_count":trades, "costs":f"{costs:.2f}", "equity_curve":[f"{v:.2f}" for v in curve], "warnings":["Deterministic demo data only; not market data.", "Simplified close-price fill model; broker paper/live fills may differ.", "Trade count is insufficient for investment conclusions."]}
+    result["kill_switch"] = kill_switch(result["maximum_drawdown_percent"], strategy.risk)
+    return result
 
 def init_db():
     with db() as con:
-        con.executescript("""CREATE TABLE IF NOT EXISTS strategies(id TEXT PRIMARY KEY,body TEXT NOT NULL,hash TEXT NOT NULL,created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS approvals(id TEXT PRIMARY KEY,strategy_id TEXT NOT NULL,mode TEXT NOT NULL,account_id TEXT NOT NULL,expires_at TEXT NOT NULL,strategy_hash TEXT NOT NULL,engine_hash TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS audit_events(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT NOT NULL,kind TEXT NOT NULL,payload TEXT NOT NULL);""")
+        con.executescript("""CREATE TABLE IF NOT EXISTS strategies(id TEXT PRIMARY KEY,body TEXT NOT NULL,hash TEXT NOT NULL,created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS approvals(id TEXT PRIMARY KEY,strategy_id TEXT NOT NULL,mode TEXT NOT NULL,account_id TEXT NOT NULL,expires_at TEXT NOT NULL,strategy_hash TEXT NOT NULL,engine_hash TEXT NOT NULL,revoked INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS checkpoints(id TEXT PRIMARY KEY,strategy_id TEXT NOT NULL,kind TEXT NOT NULL,data_hash TEXT NOT NULL,engine_hash TEXT NOT NULL,payload TEXT NOT NULL,created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS audit_events(id INTEGER PRIMARY KEY AUTOINCREMENT,at TEXT NOT NULL,kind TEXT NOT NULL,payload TEXT NOT NULL);""")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI): init_db(); yield
@@ -184,7 +190,21 @@ def get_strategy(strategy_id: str):
 @app.post("/api/strategies/{strategy_id}/backtest")
 def backtest(strategy_id: str):
     item = get_strategy(strategy_id); result = metrics(Strategy.model_validate(item["strategy"]), demo_bars())
-    audit("backtest.completed", {"strategy_id":strategy_id,"data":"deterministic-demo-v1","result":result}); return {"data":"deterministic-demo-v1", "strategy_hash":item["strategy_hash"], "result":result, "disclaimer":DISCLAIMER}
+    checkpoint_id, result_hash = str(uuid.uuid4()), digest(result)
+    payload = {"data":"deterministic-demo-v1", "result":result, "strategy_hash":item["strategy_hash"]}
+    with db() as con: con.execute("INSERT INTO checkpoints VALUES(?,?,?,?,?,?,?)", (checkpoint_id, strategy_id, "backtest-baseline", result_hash, ENGINE_HASH, canonical(payload), now().isoformat()))
+    audit("backtest.completed", {"strategy_id":strategy_id,"checkpoint_id":checkpoint_id,"data":"deterministic-demo-v1","result_hash":result_hash})
+    return {**payload, "checkpoint_id":checkpoint_id, "checkpoint_hash":result_hash, "disclaimer":DISCLAIMER}
+@app.get("/api/strategies/{strategy_id}/monitoring")
+def monitoring(strategy_id: str):
+    item = get_strategy(strategy_id)
+    with db() as con:
+        checkpoint = con.execute("SELECT * FROM checkpoints WHERE strategy_id=? ORDER BY created_at DESC LIMIT 1", (strategy_id,)).fetchone()
+        approval = con.execute("SELECT * FROM approvals WHERE strategy_id=? AND mode='paper' AND revoked=0 ORDER BY expires_at DESC LIMIT 1", (strategy_id,)).fetchone()
+    if not checkpoint: raise HTTPException(404, "No immutable backtest baseline")
+    active = approval and datetime.fromisoformat(approval["expires_at"]) > now()
+    return {"strategy_id":strategy_id, "baseline":{"checkpoint_id":checkpoint["id"],"hash":checkpoint["data_hash"],"created_at":checkpoint["created_at"],"data":"deterministic-demo-v1"}, "lifecycle":{"backtest":"complete","paper_forward":"awaiting broker-reconciled observations" if active else "approval required","broker_reconciliation":"unavailable","execution":"hard-blocked"}, "kill_switch":{"state":"ARMED","action":"revokes execution eligibility when reconciled metrics breach approved limits; no broker calls exist"}, "disclaimer":DISCLAIMER}
+
 @app.post("/api/approvals")
 def approve(req: ApprovalRequest):
     if req.mode == "live":
