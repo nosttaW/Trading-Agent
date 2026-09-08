@@ -1,0 +1,12 @@
+.git
+.github
+.pytest_cache
+__pycache__
+*.py[cod]
+*.db
+keys.env
+.env
+frontend/node_modules
+frontend/dist
+frontend/*.tsbuildinfo
+tests

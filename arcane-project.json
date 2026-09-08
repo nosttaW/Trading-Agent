@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "name": "guardrail-trading",
+  "environmentId": "0",
+  "composeProject": "guardrail-trading",
+  "services": ["guardrail-trading"],
+  "containers": ["guardrail-trading"],
+  "image": "guardrail-trading:latest",
+  "dashboard": "http://192.168.2.60:8200/",
+  "status": "http://192.168.2.60:8200/api/status",
+  "executionEnabled": false
+}
