@@ -1,10 +1,7 @@
 name: guardrail-trading
 services:
   guardrail-trading:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: guardrail-trading:latest
+    image: ghcr.io/nosttaw/trading-agent:31458aa841dcb0f2523616f530854c389caf8cb5
     container_name: guardrail-trading
     restart: unless-stopped
     environment:

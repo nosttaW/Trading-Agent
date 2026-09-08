@@ -5,7 +5,7 @@
   "composeProject": "guardrail-trading",
   "services": ["guardrail-trading"],
   "containers": ["guardrail-trading"],
-  "image": "guardrail-trading:latest",
+  "image": "ghcr.io/nosttaw/trading-agent:31458aa841dcb0f2523616f530854c389caf8cb5",
   "dashboard": "http://192.168.2.60:8200/",
   "status": "http://192.168.2.60:8200/api/status",
   "executionEnabled": false
