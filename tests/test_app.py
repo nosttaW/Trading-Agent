@@ -213,6 +213,22 @@ def test_cancel_preserves_candidates():
     assert len(canceled["candidates"]) == len(started["candidates"]) == 1
 
 
+def test_instrument_and_timeframe_are_configurable_and_frozen():
+    created = client.post("/api/research-sessions", json=session_config(instruments=["aapl"], timeframe="15m")).json()
+    assert created["config"]["instruments"] == ["AAPL"]
+    assert created["config"]["timeframe"] == "15m"
+    client.post(f"/api/research-sessions/{created['id']}/start")
+    completed = client.post(f"/api/research-sessions/{created['id']}/control", json={"action": "stop"}).json()
+    result = completed["backtests"][0]
+    assert result["assumptions"]["instruments"] == ["AAPL"]
+    assert result["assumptions"]["timeframe"] == "15m"
+    assert result["dataset_id"].endswith("-15m")
+
+
+@pytest.mark.parametrize("instruments", [[""], ["../SPY"], ["SPY;DROP"], ["TOO-LONG-SYMBOL"]])
+def test_invalid_instrument_rejected(instruments):
+    assert client.post("/api/research-sessions", json=session_config(instruments=instruments)).status_code == 422
+
 def test_audit_chain_links_events():
     client.post("/api/research-sessions", json=session_config())
     client.post("/api/research-sessions", json=session_config(name="Second research session"))

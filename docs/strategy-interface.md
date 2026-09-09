@@ -52,7 +52,7 @@ Trusted host validates every result. NaN/Infinity, unknown fields, oversized out
 - **Fill:** resulting intent fills no earlier than next eligible bar open.
 - **Missing data:** no forward fill. Dataset validation must reject unordered, duplicate, missing, nonpositive, or stale events before non-demo use.
 - **State:** safe JSON only; never pickle.
-- **Sessions:** US-equity regular-session daily bars. UTC internally.
+- **Sessions:** one validated US-equity symbol; 1m, 5m, 15m, 1h, or 1d regular-session bars. UTC internally.
 - **Corporate actions:** absent from deterministic demo fixture. Real historical use blocked until licensed adjusted/raw provenance and event-time semantics are implemented.
 - **Stops/targets:** unsupported; no same-bar ambiguity is hidden.
 - **Reversal:** long-only; exit before any later re-entry.

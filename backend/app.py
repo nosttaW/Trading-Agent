@@ -116,13 +116,22 @@ def json_row(row: sqlite3.Row, fields: tuple[str, ...]) -> dict[str, Any]:
     return item
 
 
-def demo_bars() -> list[dict[str, Any]]:
-    """Deterministic OHLCV fixture. Explicitly not observed market data."""
+TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "1d": 390}
+
+
+def demo_bars(timeframe: str = "1d") -> list[dict[str, Any]]:
+    """Deterministic OHLCV fixture. Explicitly not observed or symbol-specific data."""
+    if timeframe not in TIMEFRAME_MINUTES:
+        raise ValueError("unsupported timeframe")
     result: list[dict[str, Any]] = []
     close = Decimal("100")
-    current = datetime(2022, 1, 3, 21, 0, tzinfo=UTC)
+    current = datetime(2022, 1, 3, 14, 30, tzinfo=UTC)
+    step = timedelta(minutes=TIMEFRAME_MINUTES[timeframe])
     while len(result) < 620:
-        if current.weekday() < 5:
+        session_open = current.replace(hour=14, minute=30, second=0, microsecond=0)
+        session_close = current.replace(hour=21, minute=0, second=0, microsecond=0)
+        eligible = current.weekday() < 5 and (timeframe == "1d" or session_open <= current < session_close)
+        if eligible:
             i = len(result)
             regime = Decimal("0.0011") if (i // 75) % 3 != 1 else Decimal("-0.0008")
             wave = Decimal(((i * 29) % 17) - 8) / Decimal("10000")
@@ -131,10 +140,14 @@ def demo_bars() -> list[dict[str, Any]]:
             high = max(open_price, close) * Decimal("1.0025")
             low = min(open_price, close) * Decimal("0.9975")
             result.append({
-                "timestamp": current.isoformat(), "open": f"{open_price:.2f}", "high": f"{high:.2f}",
+                "timestamp": (session_close if timeframe == "1d" else current).isoformat(), "open": f"{open_price:.2f}", "high": f"{high:.2f}",
                 "low": f"{low:.2f}", "close": f"{close:.2f}", "volume": 1_000_000 + (i * 7919) % 500_000,
             })
-        current += timedelta(days=1)
+        current += step
+        if timeframe != "1d" and current >= session_close:
+            current = (current + timedelta(days=1)).replace(hour=14, minute=30, second=0, microsecond=0)
+        elif timeframe == "1d":
+            current = (current + timedelta(days=1)).replace(hour=14, minute=30, second=0, microsecond=0)
     return result
 
 
@@ -175,9 +188,9 @@ class SessionConfig(BaseModel):
     name: str = Field(default="Momentum research", min_length=3, max_length=120)
     provider_id: str | None = None
     instructions: str = Field(default="Explore robust long-only trend and mean-reversion hypotheses.", min_length=10, max_length=4000)
-    instruments: list[Literal["SPY"]] = Field(default_factory=lambda: ["SPY"], min_length=1, max_length=1)
+    instruments: list[str] = Field(default_factory=lambda: ["SPY"], min_length=1, max_length=1)
     market: Literal["US_EQUITIES"] = "US_EQUITIES"
-    timeframe: Literal["1d"] = "1d"
+    timeframe: Literal["1m", "5m", "15m", "1h", "1d"] = "1d"
     allowed_families: list[Literal["moving_average", "rsi", "channel_breakout"]] = Field(default_factory=lambda: ["moving_average", "rsi", "channel_breakout"], min_length=1)
     historical_start: str = "2022-01-03"
     historical_end: str = "2024-05-17"
@@ -202,6 +215,10 @@ class SessionConfig(BaseModel):
     def assumptions(self):
         if self.development_percent + self.validation_percent + self.holdout_percent != 100:
             raise ValueError("development, validation, and holdout must total 100")
+        symbols = [symbol.strip().upper() for symbol in self.instruments]
+        if any(not symbol or len(symbol) > 10 or not symbol[0].isalpha() or any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-" for char in symbol) for symbol in symbols):
+            raise ValueError("instrument must be a valid US-equity symbol")
+        self.instruments = symbols
         for value in (self.starting_capital, self.allocation_fraction, self.fee_bps, self.spread_bps, self.slippage_bps, self.max_drawdown_percent):
             decimal_value(value)
         if not Decimal("0") < Decimal(self.allocation_fraction) <= Decimal("1"):
@@ -584,7 +601,7 @@ def desired_position(family: str, params: dict[str, int], closes: list[Decimal],
 
 
 def backtest_candidate(candidate: sqlite3.Row, config: dict[str, Any]) -> dict[str, Any]:
-    bars = demo_bars()
+    bars = demo_bars(config["timeframe"])
     closes = [Decimal(bar["close"]) for bar in bars]
     opens = [Decimal(bar["open"]) for bar in bars]
     params = json.loads(candidate["parameters"])
@@ -687,19 +704,19 @@ def run_backtests(session_id: str) -> None:
         if candidate["status"] != "VALID":
             continue
         backtest_id = str(uuid.uuid4())
-        assumptions = {key: config[key] for key in ("starting_capital", "fee_bps", "spread_bps", "slippage_bps", "historical_start", "historical_end", "development_percent", "validation_percent", "holdout_percent")}
+        assumptions = {key: config[key] for key in ("instruments", "timeframe", "starting_capital", "fee_bps", "spread_bps", "slippage_bps", "historical_start", "historical_end", "development_percent", "validation_percent", "holdout_percent")}
         try:
             result = backtest_candidate(candidate, config)
             with connect() as connection:
                 connection.execute(
                     "INSERT OR IGNORE INTO backtests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (backtest_id, session_id, candidate["id"], "COMPLETED", DATASET_ID, digest(demo_bars()), ENGINE_VERSION, ENGINE_HASH, canonical(assumptions), canonical(result["metrics"]), canonical(result["equity_curve"]), canonical(result["drawdown_curve"]), canonical(result["trades"]), canonical(result["warnings"]), None, iso(), iso()),
+                    (backtest_id, session_id, candidate["id"], "COMPLETED", f"{DATASET_ID}-{config['timeframe']}", digest(demo_bars(config["timeframe"])), ENGINE_VERSION, ENGINE_HASH, canonical(assumptions), canonical(result["metrics"]), canonical(result["equity_curve"]), canonical(result["drawdown_curve"]), canonical(result["trades"]), canonical(result["warnings"]), None, iso(), iso()),
                 )
-            audit("backtest.completed", "backtest", backtest_id, {"candidate_id": candidate["id"], "dataset": DATASET_ID})
+            audit("backtest.completed", "backtest", backtest_id, {"candidate_id": candidate["id"], "dataset": f"{DATASET_ID}-{config['timeframe']}", "instrument": config["instruments"][0], "timeframe": config["timeframe"]})
         except Exception as exc:
             errors += 1
             with connect() as connection:
-                connection.execute("INSERT OR IGNORE INTO backtests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (backtest_id, session_id, candidate["id"], "FAILED", DATASET_ID, digest(demo_bars()), ENGINE_VERSION, ENGINE_HASH, canonical(assumptions), None, None, None, None, "[]", str(exc)[:500], iso(), iso()))
+                connection.execute("INSERT OR IGNORE INTO backtests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (backtest_id, session_id, candidate["id"], "FAILED", f"{DATASET_ID}-{config['timeframe']}", digest(demo_bars(config["timeframe"])), ENGINE_VERSION, ENGINE_HASH, canonical(assumptions), None, None, None, None, "[]", str(exc)[:500], iso(), iso()))
     with connect() as connection:
         state = "COMPLETED_WITH_ERRORS" if errors else "COMPLETED"
         connection.execute("UPDATE research_sessions SET state=?,stopped_at=? WHERE id=?", (state, iso(), session_id))
@@ -828,7 +845,8 @@ def readiness():
 
 @app.get("/api/demo-bars")
 def get_demo_bars():
-    return {"label": "Demo · deterministic sample data · not market data", "dataset_id": DATASET_ID, "symbol": "SPY", "timeframe": "1d", "bars": demo_bars()}
+    timeframe = "1d"
+    return {"label": "Demo · deterministic sample data · not market or symbol-specific data", "dataset_id": f"{DATASET_ID}-{timeframe}", "symbol": "DEMO", "timeframe": timeframe, "bars": demo_bars(timeframe)}
 
 
 @app.get("/api/providers")

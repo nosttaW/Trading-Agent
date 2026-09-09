@@ -1,6 +1,6 @@
 # Strategy Lab
 
-Responsive strategy-research software: persistent 15-minute sessions, configurable OpenAI-compatible providers, reviewed Python strategy templates, deterministic chronological batch backtests, leaderboard/comparison, immutable live-data-test setup, audit history, fail-closed trading screens.
+Responsive strategy-research software: persistent 15-minute sessions, configurable instruments and 1m/5m/15m/1h/1d timeframes, configurable OpenAI-compatible providers, reviewed Python strategy templates, deterministic chronological batch backtests, leaderboard/comparison, immutable live-data-test setup, audit history, fail-closed trading screens.
 
 > **No profit promise. Not investment advice.** Backtests and simulations do not predict future returns. Execution can differ materially. Risk thresholds are not guaranteed loss caps.
 
@@ -9,7 +9,7 @@ Responsive strategy-research software: persistent 15-minute sessions, configurab
 | Mode | Status |
 |---|---|
 | Demo | Working. Deterministic sample bars; explicitly labeled. |
-| Historical backtest | Working for reviewed long-only SPY daily templates. |
+| Historical backtest | Working for reviewed long-only US-equity templates on 1m/5m/15m/1h/1d deterministic demo bars. Demo data is synthetic—not symbol-specific market history. |
 | Live Data Test | Persistent immutable session/setup works; awaits configured current Alpaca data; never invents ticks/fills. |
 | Broker Paper | Disabled pending authenticated adapter and reconciliation. |
 | Live Trading | Disabled. No broker-order submission implementation exists. |
