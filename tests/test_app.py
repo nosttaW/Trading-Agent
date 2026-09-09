@@ -310,6 +310,9 @@ def test_live_worker_warms_without_orders_then_processes_new_bar(monkeypatch):
     assert running["last_event_at"] == bars[-1]["timestamp"]
     assert len(running["runtime_state"]["equity_curve"]) == 2
     assert running["runtime_state"]["equity_curve"][-1]["at"] == bars[-1]["timestamp"]
+    assert running["runtime_state"]["price_bars"][-1]["timestamp"] == bars[-1]["timestamp"]
+    assert running["runtime_state"]["bars_available"] == len(bars)
+    assert running["runtime_state"]["last_poll_at"]
     # Same event is deduplicated across repeated server cycles.
     service.process_live_tests()
     repeated = client.get(f"/api/live-tests/{created['id']}").json()
