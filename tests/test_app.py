@@ -202,6 +202,61 @@ def test_paper_resume_reconciles_and_order_is_idempotent(monkeypatch):
     assert len(fake.submissions) == 1
 
 
+def enable_automation(approved):
+    expected = f"ENABLE AUTONOMOUS PAPER {approved['instrument']} {approved['strategy_hash'][:12]}"
+    return client.post(f"/api/paper-sessions/{approved['id']}/automation", json={"enabled": True, "confirmation": expected})
+
+
+def test_paper_automation_requires_separate_opt_in(monkeypatch):
+    approved, fake = paper_ready(monkeypatch)
+    assert approved["automation_enabled"] == 0 and approved["automation_state"] == "DISABLED"
+    assert client.post(f"/api/paper-sessions/{approved['id']}/automation", json={"enabled": True, "confirmation": "wrong"}).status_code == 422
+    client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})
+    enabled = enable_automation(approved)
+    assert enabled.status_code == 200 and enabled.json()["automation_enabled"] == 1
+    assert fake.submissions == []
+
+
+def test_paper_automation_closed_bar_entry_is_sized_and_idempotent(monkeypatch):
+    approved, fake = paper_ready(monkeypatch)
+    client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})
+    assert enable_automation(approved).status_code == 200
+    bars = service.demo_bars("15m")[-100:]
+    for index, bar in enumerate(bars): bar["close"] = bar["open"] = bar["high"] = bar["low"] = str(100 + index)
+    monkeypatch.setattr(service, "latest_alpaca_bars", lambda *args: bars)
+    monkeypatch.setattr(service, "closed_bars", lambda incoming, _: incoming)
+    service.process_paper_automation(); service.process_paper_automation()
+    assert len(fake.submissions) == 1
+    assert fake.submissions[0]["side"] == "buy" and fake.submissions[0]["qty"] == "4.522"
+    assert float(fake.submissions[0]["qty"]) * 199 <= 900
+    result = client.get(f"/api/paper-sessions/{approved['id']}").json()
+    assert result["automation_state"] == "RUNNING" and result["automation_runtime"]["signal"] == "LONG"
+
+
+def test_paper_automation_pauses_then_retries_data_failure(monkeypatch):
+    approved, fake = paper_ready(monkeypatch)
+    client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})
+    enable_automation(approved)
+    monkeypatch.setattr(service, "latest_alpaca_bars", lambda *args: (_ for _ in ()).throw(service.HTTPException(504, "data unavailable")))
+    service.process_paper_automation()
+    result = client.get(f"/api/paper-sessions/{approved['id']}").json()
+    assert result["state"] == "PAUSED" and result["automation_state"] == "RETRYING"
+    assert result["automation_runtime"]["auto_paused"] is True and fake.submissions == []
+
+
+def test_paper_automation_disable_and_emergency_stop_block_worker(monkeypatch):
+    approved, fake = paper_ready(monkeypatch)
+    client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})
+    enable_automation(approved)
+    disabled = client.post(f"/api/paper-sessions/{approved['id']}/automation", json={"enabled": False, "confirmation": "DISABLE AUTONOMOUS PAPER"})
+    assert disabled.json()["automation_enabled"] == 0
+    service.process_paper_automation(); assert fake.submissions == []
+    enable_automation(approved)
+    stopped = client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "emergency_stop", "confirmation": "EMERGENCY STOP PAPER"})
+    service.process_paper_automation()
+    assert stopped.json()["state"] == "HALTED" and fake.submissions == []
+
+
 def test_paper_risk_gate_and_emergency_stop(monkeypatch):
     approved, fake = paper_ready(monkeypatch)
     client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})

@@ -201,7 +201,11 @@ CREATE TABLE IF NOT EXISTS paper_sessions (
   lease_owner TEXT,
   lease_until TEXT,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  automation_enabled INTEGER NOT NULL DEFAULT 0,
+  automation_state TEXT NOT NULL DEFAULT 'DISABLED',
+  automation_runtime TEXT NOT NULL DEFAULT '{}',
+  automation_logs TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS paper_orders (
