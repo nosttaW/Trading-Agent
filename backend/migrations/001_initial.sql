@@ -1,6 +1,11 @@
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
+CREATE TABLE IF NOT EXISTS app_metadata (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS providers (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -32,6 +37,19 @@ CREATE TABLE IF NOT EXISTS alpaca_connections (
   account_id_masked TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS market_datasets (
+  id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  instrument TEXT NOT NULL,
+  timeframe TEXT NOT NULL,
+  start_at TEXT NOT NULL,
+  end_at TEXT NOT NULL,
+  feed TEXT NOT NULL,
+  bars TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS research_sessions (

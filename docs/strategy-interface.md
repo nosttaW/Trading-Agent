@@ -53,7 +53,7 @@ Trusted host validates every result. NaN/Infinity, unknown fields, oversized out
 - **Missing data:** no forward fill. Dataset validation must reject unordered, duplicate, missing, nonpositive, or stale events before non-demo use.
 - **State:** safe JSON only; never pickle.
 - **Sessions:** one validated US-equity symbol; 1m, 5m, 15m, 1h, or 1d regular-session bars. UTC internally.
-- **Corporate actions:** absent from deterministic demo fixture. Real historical use blocked until licensed adjusted/raw provenance and event-time semantics are implemented.
+- **Corporate actions:** Alpaca requests use `adjustment=all`; exact provider adjustment methodology and event-time availability remain modeling limitations recorded with the dataset provenance.
 - **Stops/targets:** unsupported; no same-bar ambiguity is hidden.
 - **Reversal:** long-only; exit before any later re-entry.
 - **Fractional quantities:** round down to 0.001 share.
@@ -64,4 +64,4 @@ Trusted host validates every result. NaN/Infinity, unknown fields, oversized out
 
 Daily Sharpe uses arithmetic daily returns, zero risk-free rate, sample standard deviation, annualization `sqrt(252)`. Sortino uses root-mean-square nonpositive daily returns and `sqrt(252)`. Undefined values render as unavailable. Benchmark: buy-and-hold first close to final close without benchmark costs. These conventions are descriptive only.
 
-The UI describes 60/20/20 development/validation/final-holdout configuration. The compact demo provides full-period descriptive metrics but does not claim completed walk-forward, parameter-sensitivity, or untouched final-holdout analysis. Ranking excludes holdout claims and never labels maximum return “best.”
+The UI describes 60/20/20 development/validation/final-holdout configuration. The compact implementation provides full-period descriptive metrics but does not claim completed walk-forward, parameter-sensitivity, or untouched final-holdout analysis. Ranking excludes holdout claims and never labels maximum return “best.”

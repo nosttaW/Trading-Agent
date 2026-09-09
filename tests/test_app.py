@@ -20,11 +20,13 @@ client = TestClient(service.app)
 
 
 @pytest.fixture(autouse=True)
-def clean_database():
+def clean_database(monkeypatch):
     if TEST_DB.exists():
         TEST_DB.unlink()
     service.init_db()
     service.LOGIN_FAILURES.clear()
+    monkeypatch.setattr(service, "alpaca_data_connection", lambda: True)
+    monkeypatch.setattr(service, "fetch_alpaca_bars", lambda *args: (service.demo_bars(args[1]), "iex"))
     login = client.post("/api/auth/login", json={"password": "correct horse battery staple"})
     assert login.status_code == 200
     client.headers["x-csrf-token"] = login.json()["csrf_token"]
@@ -45,7 +47,10 @@ def session_config(**changes):
     return value
 
 
-def create_completed_session():
+def create_completed_session(monkeypatch=None):
+    if monkeypatch:
+        monkeypatch.setattr(service, "alpaca_data_connection", lambda: True)
+        monkeypatch.setattr(service, "fetch_alpaca_bars", lambda *args: (service.demo_bars(args[1]), "iex"))
     created = client.post("/api/research-sessions", json=session_config()).json()
     started = client.post(f"/api/research-sessions/{created['id']}/start").json()
     assert started["state"] == "GENERATING"
@@ -84,7 +89,7 @@ def test_login_rate_limit():
 
 def test_status_fails_closed_for_execution():
     result = client.get("/api/status").json()
-    assert result["mode"] == "DEMO"
+    assert result["mode"] == "CONNECTED"
     assert result["arbitrary_python_enabled"] is False
     assert result["broker_submission_enabled"] is False
     assert client.post("/api/orders", json={}).status_code == 403
@@ -162,7 +167,7 @@ class FakePaperBroker:
 
 
 def paper_ready(monkeypatch):
-    completed = create_completed_session(); backtest = completed["backtests"][0]; fake = FakePaperBroker()
+    completed = create_completed_session(monkeypatch); backtest = completed["backtests"][0]; fake = FakePaperBroker()
     monkeypatch.setattr(service, "paper_broker", lambda: fake)
     detail = client.get(f"/api/backtests/{backtest['id']}").json()
     expected = f"APPROVE BROKER PAPER SPY {detail['source_hash'][:12]}"
@@ -176,6 +181,11 @@ def test_paper_approval_starts_halted_and_binds_hash(monkeypatch):
     assert approved["state"] == "HALTED" and approved["emergency_stop"] == 1
     assert approved["strategy_hash"] and approved["engine_hash"] == service.ENGINE_HASH
     assert approved["broker_account_id"] == "paper-account-1"
+    assert approved["limits"]["capital_allocation"] == "9000.00"
+    assert approved["limits"]["max_order_notional"] == "900.00"
+    assert approved["limits"]["max_position_notional"] == "2250.00"
+    assert approved["limits"]["max_order_percent"] == "10.00"
+    assert approved["limits"]["max_position_percent"] == "25.00"
 
 
 def test_paper_resume_reconciles_and_order_is_idempotent(monkeypatch):
@@ -193,7 +203,7 @@ def test_paper_resume_reconciles_and_order_is_idempotent(monkeypatch):
 def test_paper_risk_gate_and_emergency_stop(monkeypatch):
     approved, fake = paper_ready(monkeypatch)
     client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})
-    excessive = {"side": "buy", "quantity": "3", "reference_price": "100", "bar_at": "2026-01-02T15:00:00Z", "confirmation": "Submit Broker Paper Order"}
+    excessive = {"side": "buy", "quantity": "10", "reference_price": "100", "bar_at": "2026-01-02T15:00:00Z", "confirmation": "Submit Broker Paper Order"}
     assert client.post(f"/api/paper-sessions/{approved['id']}/orders", json=excessive).status_code == 422
     stopped = client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "emergency_stop", "confirmation": "EMERGENCY STOP PAPER"})
     assert stopped.status_code == 200 and stopped.json()["state"] == "HALTED" and fake.canceled
@@ -320,7 +330,7 @@ def test_instrument_and_timeframe_are_configurable_and_frozen():
     result = completed["backtests"][0]
     assert result["assumptions"]["instruments"] == ["AAPL"]
     assert result["assumptions"]["timeframe"] == "15m"
-    assert result["dataset_id"].endswith("-15m")
+    assert "-AAPL-15m-" in result["dataset_id"]
 
 
 @pytest.mark.parametrize("instruments", [[""], ["../SPY"], ["SPY;DROP"], ["TOO-LONG-SYMBOL"]])

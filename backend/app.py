@@ -39,7 +39,7 @@ DB = Path(os.getenv("TRADING_DB_PATH", ROOT / "trading.db"))
 MIGRATION = ROOT / "migrations" / "001_initial.sql"
 ENGINE_VERSION = "template-engine-2.0"
 ENGINE_HASH = hashlib.sha256((Path(__file__).read_bytes() + MIGRATION.read_bytes())).hexdigest()
-DATASET_ID = "DEMO-US-EQUITIES-DAILY-v2"
+DATASET_ID = "ALPACA-US-EQUITIES"
 PROMPT_VERSION = "reviewed-template-v1"
 DISCLAIMER = "Backtests and simulations do not predict future returns. Execution can differ materially. Losses can exceed risk thresholds during gaps, slippage, or outages."
 SESSION_STATES = {"DRAFT", "GENERATING", "PAUSED", "STOPPING", "BACKTESTING", "COMPLETED", "COMPLETED_WITH_ERRORS", "CANCELED", "FAILED"}
@@ -97,6 +97,17 @@ def init_db() -> None:
         candidate_columns = {row[1] for row in connection.execute("PRAGMA table_info(candidates)").fetchall()}
         if "archived_at" not in candidate_columns:
             connection.execute("ALTER TABLE candidates ADD COLUMN archived_at TEXT")
+        migrated = connection.execute("SELECT value FROM app_metadata WHERE key='synthetic_data_removed_v1'").fetchone()
+        if not migrated:
+            # User-confirmed destructive removal: old datasets were deterministic fixtures, never market observations.
+            connection.execute("DELETE FROM paper_orders")
+            connection.execute("DELETE FROM paper_sessions")
+            connection.execute("DELETE FROM live_tests")
+            connection.execute("DELETE FROM approvals")
+            connection.execute("DELETE FROM backtests")
+            connection.execute("DELETE FROM candidates")
+            connection.execute("DELETE FROM research_sessions")
+            connection.execute("INSERT INTO app_metadata(key,value) VALUES('synthetic_data_removed_v1',?)", (iso(),))
 
 
 def audit(kind: str, resource_type: str, resource_id: str, payload: dict[str, Any], actor: str = "local-user") -> None:
@@ -290,9 +301,8 @@ class LiveControlInput(BaseModel):
 class PaperApprovalInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     backtest_id: str
-    capital_allocation: str = "1000.00"
-    max_order_notional: str = "250.00"
-    max_position_notional: str = "1000.00"
+    max_order_percent: str = "10.00"
+    max_position_percent: str = "25.00"
     max_daily_loss: str = "100.00"
     max_drawdown_percent: str = "10.00"
     max_orders_per_hour: int = Field(default=4, ge=1, le=60)
@@ -301,9 +311,14 @@ class PaperApprovalInput(BaseModel):
 
     @model_validator(mode="after")
     def limits(self):
-        values = [decimal_value(getattr(self, field), positive=True) for field in ("capital_allocation", "max_order_notional", "max_position_notional", "max_daily_loss", "max_drawdown_percent")]
-        if values[1] > values[0] or values[2] > values[0]:
-            raise ValueError("order and position limits cannot exceed capital allocation")
+        order = decimal_value(self.max_order_percent, positive=True)
+        position = decimal_value(self.max_position_percent, positive=True)
+        decimal_value(self.max_daily_loss, positive=True)
+        drawdown = decimal_value(self.max_drawdown_percent, positive=True)
+        if order > 100 or position > 100 or drawdown > 100:
+            raise ValueError("percentage limits cannot exceed 100")
+        if order > position:
+            raise ValueError("maximum order percentage cannot exceed maximum position percentage")
         return self
 
 
@@ -505,6 +520,51 @@ async def call_provider(row: sqlite3.Row, purpose: str = "test") -> dict[str, An
         return {"ok": True, "usage": usage, "response": data}
     except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.NetworkError, ValueError, json.JSONDecodeError) as exc:
         raise provider_error(exc)
+
+
+def alpaca_data_connection() -> sqlite3.Row:
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM alpaca_connections WHERE mode='data' AND last_test_status='CONNECTED'").fetchone()
+    if not row:
+        raise HTTPException(503, "Test an Alpaca market-data connection before research")
+    return row
+
+
+def fetch_alpaca_bars(instrument: str, timeframe: str, start: str, end: str) -> tuple[list[dict[str, Any]], str]:
+    row = alpaca_data_connection()
+    mapping = {"1m": "1Min", "5m": "5Min", "15m": "15Min", "1h": "1Hour", "1d": "1Day"}
+    headers = {"APCA-API-KEY-ID": decrypt_secret(row["encrypted_key_id"]), "APCA-API-SECRET-KEY": decrypt_secret(row["encrypted_secret_key"])}
+    params: dict[str, Any] = {"timeframe": mapping[timeframe], "start": f"{start}T00:00:00Z", "end": f"{end}T23:59:59Z", "limit": 10000, "adjustment": "all", "feed": row["feed"], "sort": "asc"}
+    bars: list[dict[str, Any]] = []
+    next_token = None
+    try:
+        with httpx.Client(timeout=30, follow_redirects=False) as client:
+            while len(bars) < 100_000:
+                if next_token: params["page_token"] = next_token
+                response = client.get(f"{row['base_url']}/v2/stocks/{instrument}/bars", headers=headers, params=params)
+                if 300 <= response.status_code < 400: raise HTTPException(502, "Alpaca redirect rejected")
+                response.raise_for_status()
+                payload = response.json()
+                page = payload.get("bars")
+                if not isinstance(page, list): raise ValueError
+                bars.extend({"timestamp": item["t"], "open": str(item["o"]), "high": str(item["h"]), "low": str(item["l"]), "close": str(item["c"]), "volume": item["v"]} for item in page)
+                next_token = payload.get("next_page_token")
+                if not next_token: break
+        if len(bars) < 2: raise HTTPException(422, "Alpaca returned insufficient historical bars for this selection")
+        previous = None
+        for bar in bars:
+            stamp = datetime.fromisoformat(bar["timestamp"].replace("Z", "+00:00"))
+            prices = [decimal_value(bar[key], positive=True) for key in ("open", "high", "low", "close")]
+            if previous and stamp <= previous: raise HTTPException(502, "Alpaca bars are duplicate or out of order")
+            if prices[1] < max(prices[0], prices[3]) or prices[2] > min(prices[0], prices[3]) or int(bar["volume"]) < 0: raise HTTPException(502, "Alpaca returned an invalid bar")
+            previous = stamp
+        return bars, row["feed"]
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in {401, 403}: raise HTTPException(502, "Alpaca market-data authentication or entitlement failed")
+        if exc.response.status_code == 429: raise HTTPException(503, "Alpaca market-data rate limit reached")
+        raise HTTPException(502, f"Alpaca market data returned HTTP {exc.response.status_code}")
+    except (httpx.TimeoutException, httpx.NetworkError): raise HTTPException(504, "Alpaca market data timed out")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError): raise HTTPException(502, "Alpaca market data returned malformed bars")
 
 
 def test_alpaca(row: sqlite3.Row) -> dict[str, Any]:
@@ -842,8 +902,7 @@ def desired_position(family: str, params: dict[str, int], closes: list[Decimal],
     return True if not current and closes[index] > prior_high else False if current and closes[index] < prior_low else current
 
 
-def backtest_candidate(candidate: sqlite3.Row, config: dict[str, Any]) -> dict[str, Any]:
-    bars = demo_bars(config["timeframe"])
+def backtest_candidate(candidate: sqlite3.Row, config: dict[str, Any], bars: list[dict[str, Any]]) -> dict[str, Any]:
     closes = [Decimal(bar["close"]) for bar in bars]
     opens = [Decimal(bar["open"]) for bar in bars]
     params = json.loads(candidate["parameters"])
@@ -915,7 +974,7 @@ def backtest_candidate(candidate: sqlite3.Row, config: dict[str, Any]) -> dict[s
     downside_dev = math.sqrt(sum(item * item for item in downside) / len(downside)) if downside else 0
     sharpe = mean / stdev * math.sqrt(252) if stdev else None
     sortino = mean / downside_dev * math.sqrt(252) if downside_dev else None
-    warnings = ["Deterministic demo dataset; not observed market data.", "Daily bars; next-open fills use disclosed costs, not queue position or broker parity.", "Final holdout is excluded from selection ranking and remains locked in this demo.", "Multiple testing can inflate apparent performance."]
+    warnings = ["Alpaca historical bars; provider feed, retrieval time, and content hash are frozen with this result.", "Next-bar-open fills use disclosed costs, not queue position or broker parity.", "Final holdout is excluded from selection ranking and remains locked.", "Multiple testing can inflate apparent performance."]
     if len(closed) < config["minimum_trade_count"]:
         warnings.append("Trade count below configured minimum; ratios are unstable.")
     metrics = {
@@ -941,24 +1000,36 @@ def run_backtests(session_id: str) -> None:
         config = json.loads(session["config"])
         connection.execute("UPDATE research_sessions SET state='BACKTESTING',next_run_at=NULL,in_flight=0 WHERE id=?", (session_id,))
         candidates = connection.execute("SELECT * FROM candidates WHERE session_id=? ORDER BY ordinal", (session_id,)).fetchall()
+    try:
+        bars, feed = fetch_alpaca_bars(config["instruments"][0], config["timeframe"], config["historical_start"], config["historical_end"])
+    except HTTPException as exc:
+        with connect() as connection:
+            connection.execute("UPDATE research_sessions SET state='FAILED',stopped_at=?,last_error=? WHERE id=?", (iso(), str(exc.detail), session_id))
+        audit("session.failed", "research_session", session_id, {"error": str(exc.detail)})
+        return
+    dataset_hash = digest(bars)
+    dataset_id = f"{DATASET_ID}-{config['instruments'][0]}-{config['timeframe']}-{dataset_hash[:12]}"
+    with connect() as connection:
+        connection.execute("INSERT OR IGNORE INTO market_datasets VALUES(?,?,?,?,?,?,?,?,?,?)", (dataset_id, "alpaca", config["instruments"][0], config["timeframe"], config["historical_start"], config["historical_end"], feed, canonical(bars), dataset_hash, iso()))
     errors = 0
     for candidate in candidates:
         if candidate["status"] != "VALID":
             continue
         backtest_id = str(uuid.uuid4())
         assumptions = {key: config[key] for key in ("instruments", "timeframe", "starting_capital", "fee_bps", "spread_bps", "slippage_bps", "historical_start", "historical_end", "development_percent", "validation_percent", "holdout_percent")}
+        assumptions["data_provider"], assumptions["data_feed"], assumptions["retrieved_at"] = "alpaca", feed, iso()
         try:
-            result = backtest_candidate(candidate, config)
+            result = backtest_candidate(candidate, config, bars)
             with connect() as connection:
                 connection.execute(
                     "INSERT OR IGNORE INTO backtests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (backtest_id, session_id, candidate["id"], "COMPLETED", f"{DATASET_ID}-{config['timeframe']}", digest(demo_bars(config["timeframe"])), ENGINE_VERSION, ENGINE_HASH, canonical(assumptions), canonical(result["metrics"]), canonical(result["equity_curve"]), canonical(result["drawdown_curve"]), canonical(result["trades"]), canonical(result["warnings"]), None, iso(), iso()),
+                    (backtest_id, session_id, candidate["id"], "COMPLETED", dataset_id, dataset_hash, ENGINE_VERSION, ENGINE_HASH, canonical(assumptions), canonical(result["metrics"]), canonical(result["equity_curve"]), canonical(result["drawdown_curve"]), canonical(result["trades"]), canonical(result["warnings"]), None, iso(), iso()),
                 )
-            audit("backtest.completed", "backtest", backtest_id, {"candidate_id": candidate["id"], "dataset": f"{DATASET_ID}-{config['timeframe']}", "instrument": config["instruments"][0], "timeframe": config["timeframe"]})
+            audit("backtest.completed", "backtest", backtest_id, {"candidate_id": candidate["id"], "dataset": dataset_id, "instrument": config["instruments"][0], "timeframe": config["timeframe"]})
         except Exception as exc:
             errors += 1
             with connect() as connection:
-                connection.execute("INSERT OR IGNORE INTO backtests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (backtest_id, session_id, candidate["id"], "FAILED", f"{DATASET_ID}-{config['timeframe']}", digest(demo_bars(config["timeframe"])), ENGINE_VERSION, ENGINE_HASH, canonical(assumptions), None, None, None, None, "[]", str(exc)[:500], iso(), iso()))
+                connection.execute("INSERT OR IGNORE INTO backtests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (backtest_id, session_id, candidate["id"], "FAILED", dataset_id, dataset_hash, ENGINE_VERSION, ENGINE_HASH, canonical(assumptions), None, None, None, None, "[]", str(exc)[:500], iso(), iso()))
     with connect() as connection:
         state = "COMPLETED_WITH_ERRORS" if errors else "COMPLETED"
         connection.execute("UPDATE research_sessions SET state=?,stopped_at=? WHERE id=?", (state, iso(), session_id))
@@ -1035,7 +1106,7 @@ async def authenticate(request: Request, call_next):
 
 @app.get("/api/status")
 def status():
-    return {"status": "ok", "mode": "DEMO", "authentication_required": True, "live_trading_enabled": False, "arbitrary_python_enabled": False, "broker_submission_enabled": False, "engine_version": ENGINE_VERSION, "engine_hash": ENGINE_HASH, "disclaimer": DISCLAIMER}
+    return {"status": "ok", "mode": "CONNECTED", "authentication_required": True, "live_trading_enabled": False, "arbitrary_python_enabled": False, "broker_submission_enabled": False, "engine_version": ENGINE_VERSION, "engine_hash": ENGINE_HASH, "disclaimer": DISCLAIMER}
 
 
 @app.get("/api/auth/session")
@@ -1083,12 +1154,6 @@ def readiness():
     with connect() as connection:
         connection.execute("SELECT 1").fetchone()
     return {"status": "ready", "database": str(DB)}
-
-
-@app.get("/api/demo-bars")
-def get_demo_bars():
-    timeframe = "1d"
-    return {"label": "Demo · deterministic sample data · not market or symbol-specific data", "dataset_id": f"{DATASET_ID}-{timeframe}", "symbol": "DEMO", "timeframe": timeframe, "bars": demo_bars(timeframe)}
 
 
 @app.get("/api/providers")
@@ -1195,6 +1260,7 @@ def list_sessions():
 
 @app.post("/api/research-sessions")
 def create_session(config: SessionConfig):
+    alpaca_data_connection()
     if config.provider_id:
         with connect() as connection:
             if not connection.execute("SELECT id FROM providers WHERE id=?", (config.provider_id,)).fetchone():
@@ -1387,8 +1453,17 @@ def create_paper_session(value: PaperApprovalInput):
         raise HTTPException(409, "Broker paper account is not active")
     session_id = str(uuid.uuid4())
     expires = utcnow() + timedelta(hours=value.expires_hours)
+    equity_value = decimal_value(account.get("equity", "0"))
+    cash_value = decimal_value(account.get("cash", "0"))
+    buying_power_value = decimal_value(account.get("buying_power", "0"))
+    capital = min(equity_value, cash_value, buying_power_value)
+    if capital <= 0:
+        raise HTTPException(409, "Broker paper account has no available non-leveraged capital")
     limits = value.model_dump(mode="json", exclude={"backtest_id", "typed_approval", "expires_hours"})
-    equity = str(account.get("equity", "0"))
+    limits["capital_allocation"] = f"{capital:.2f}"
+    limits["max_order_notional"] = f"{capital * decimal_value(value.max_order_percent) / 100:.2f}"
+    limits["max_position_notional"] = f"{capital * decimal_value(value.max_position_percent) / 100:.2f}"
+    equity = str(equity_value)
     with connect() as connection:
         connection.execute("INSERT INTO paper_sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (session_id, backtest["id"], backtest["candidate_id"], backtest["source_hash"], ENGINE_HASH, str(account["id"]), instrument, timeframe, "HALTED", expires.isoformat(), canonical(limits), "{}", None, None, equity, equity, 1, None, None, iso(), iso()))
     audit("paper_session.approved_halted", "paper_session", session_id, {"instrument": instrument, "strategy_hash": backtest["source_hash"], "expires_at": expires.isoformat()})

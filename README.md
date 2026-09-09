@@ -8,8 +8,8 @@ Responsive strategy-research software: persistent 15-minute sessions, configurab
 
 | Mode | Status |
 |---|---|
-| Demo | Working. Deterministic sample bars; explicitly labeled. |
-| Historical backtest | Working for reviewed long-only US-equity templates on 1m/5m/15m/1h/1d deterministic demo bars. Demo data is synthetic—not symbol-specific market history. |
+| Connected research | Working after a tested Alpaca market-data connection. AI remains optional. |
+| Historical backtest | Working for reviewed long-only US-equity templates on 1m/5m/15m/1h/1d Alpaca historical bars frozen with feed, retrieval timestamp, and content hash. |
 | Live Data Test | Persistent immutable session/setup works; awaits configured current Alpaca data; never invents ticks/fills. |
 | Broker Paper | Working through Alpaca's official paper endpoint after encrypted credentials, connection test, immutable approval, reconciliation, explicit resume, and independent risk checks. |
 | Live Trading | Disabled. No broker-order submission implementation exists. |
@@ -62,8 +62,8 @@ Open <http://localhost:8000>. Health: <http://localhost:8000/api/health>. Readin
 
 ## Beginner workflow
 
-1. Use Demo immediately, or open **Settings → Connect endpoint**.
-2. Save server-side provider settings. Test connection. API keys return masked only.
+1. Open **Settings → Alpaca connections**, save Market Data credentials, select the entitled feed, then test it.
+2. Optionally save server-side AI provider settings. Test connection. API keys return masked only.
 3. Open **Research Sessions → New research session**.
 4. Keep default 15-minute interval. Set candidate/time/token ceilings.
 5. Start. SQLite persistence plus the backend scheduler continue after browser closure.
@@ -93,7 +93,7 @@ Open **Settings → Alpaca connections**. Credentials can be added separately fo
 
 Key IDs and secret keys are encrypted server-side with `APP_ENCRYPTION_KEY`; browser receives masked placeholders only. Connection tests call latest AAPL data or account status. Errors redact credentials. No mode fallback. Obtain keys from <https://app.alpaca.markets/>; select Paper Trading before creating paper keys.
 
-Paper approval binds completed backtest, strategy/engine hashes, broker account, symbol, timeframe, allocation, order/position/loss/drawdown/frequency limits, and an expiry of at most seven days. New sessions start `HALTED`; reconciliation plus exact typed resume is required. Every intent persists before submission with deterministic client ID. Unknown outcomes block retries until reconciliation. Partial fill fields persist. Emergency Stop blocks entries, attempts cancellation of eligible pending paper orders, preserves positions, never liquidates automatically. The compact release exposes no automatic strategy-to-order scheduler; paper orders require the protected API and exact confirmation. This avoids unattended submission before market-data event ingestion and recovery are complete.
+Paper approval binds completed backtest, strategy/engine hashes, broker account, symbol, timeframe, allocation, order/position/loss/drawdown/frequency limits, and an expiry of at most seven days. Capital defaults to the maximum non-leveraged usable amount—minimum of broker cash, equity, and buying power. Maximum order defaults to 10% and maximum position to 25% of that frozen approval-time capital. New sessions start `HALTED`; reconciliation plus exact typed resume is required. Every intent persists before submission with deterministic client ID. Unknown outcomes block retries until reconciliation. Partial fill fields persist. Emergency Stop blocks entries, attempts cancellation of eligible pending paper orders, preserves positions, never liquidates automatically. The compact release exposes no automatic strategy-to-order scheduler; paper orders require the protected API and exact confirmation. This avoids unattended submission before market-data event ingestion and recovery are complete.
 
 ## Provider behavior
 
