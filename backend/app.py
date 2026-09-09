@@ -771,9 +771,11 @@ def paper_session_public(row: sqlite3.Row) -> dict[str, Any]:
     item = json_row(row, ("limits", "strategy_state", "automation_runtime", "automation_logs"))
     with connect() as connection:
         orders = connection.execute("SELECT * FROM paper_orders WHERE paper_session_id=? ORDER BY created_at DESC LIMIT 100", (row["id"],)).fetchall()
+        candidate = connection.execute("SELECT source_hash FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
     item["orders"] = [dict(order) for order in orders]
     item["mode"] = "BROKER_PAPER"
     item["approval_active"] = datetime.fromisoformat(row["approval_expires_at"]) > utcnow()
+    item["approval_current"] = row["engine_hash"] == ENGINE_HASH and bool(candidate) and row["strategy_hash"] == candidate["source_hash"]
     return item
 
 

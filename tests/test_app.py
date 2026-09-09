@@ -207,6 +207,14 @@ def enable_automation(approved):
     return client.post(f"/api/paper-sessions/{approved['id']}/automation", json={"enabled": True, "confirmation": expected})
 
 
+def test_stale_engine_approval_is_exposed_and_can_be_retired(monkeypatch):
+    approved, _ = paper_ready(monkeypatch)
+    with service.connect() as connection: connection.execute("UPDATE paper_sessions SET engine_hash='old-engine' WHERE id=?", (approved["id"],))
+    assert client.get(f"/api/paper-sessions/{approved['id']}").json()["approval_current"] is False
+    stopped = client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "stop", "confirmation": "STOP BROKER PAPER"})
+    assert stopped.status_code == 200 and stopped.json()["state"] == "STOPPED"
+
+
 def test_stale_engine_approval_cannot_enable_automation(monkeypatch):
     approved, fake = paper_ready(monkeypatch)
     client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})
