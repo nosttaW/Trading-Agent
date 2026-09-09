@@ -21,6 +21,7 @@ import statistics
 import time
 import uuid
 import re
+import random
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
@@ -106,10 +107,21 @@ def init_db() -> None:
         backtest_columns = {row[1] for row in connection.execute("PRAGMA table_info(backtests)").fetchall()}
         if "invalidated_at" not in backtest_columns: connection.execute("ALTER TABLE backtests ADD COLUMN invalidated_at TEXT")
         if "invalidation_reason" not in backtest_columns: connection.execute("ALTER TABLE backtests ADD COLUMN invalidation_reason TEXT")
+        period_seed = connection.execute("SELECT value FROM app_metadata WHERE key='strategy_period_uses_seeded_v1'").fetchone()
+        if not period_seed:
+            for backtest in connection.execute("SELECT b.id,b.candidate_id,b.assumptions FROM backtests b").fetchall():
+                assumptions = json.loads(backtest["assumptions"])
+                if assumptions.get("historical_start") and assumptions.get("historical_end"):
+                    connection.execute("INSERT INTO strategy_period_uses VALUES(?,?,?,?,?,?,?)", (str(uuid.uuid4()), backtest["candidate_id"], None, "development_or_selection", assumptions["historical_start"], assumptions["historical_end"], iso()))
+            connection.execute("INSERT INTO app_metadata(key,value) VALUES('strategy_period_uses_seeded_v1',?)", (iso(),))
         invalidation = connection.execute("SELECT value FROM app_metadata WHERE key='backtest_semantics_v3_invalidated'").fetchone()
         if not invalidation:
             connection.execute("UPDATE backtests SET invalidated_at=?,invalidation_reason='Superseded: prior engine could truncate one-minute history, double-count fees, include extended hours, omit daily flattening, or mis-annualize intraday ratios' WHERE status='COMPLETED'", (iso(),))
             connection.execute("INSERT INTO app_metadata(key,value) VALUES('backtest_semantics_v3_invalidated',?)", (iso(),))
+        validation_engine_migration = connection.execute("SELECT value FROM app_metadata WHERE key='validation_engine_v1_backtests_invalidated'").fetchone()
+        if not validation_engine_migration:
+            connection.execute("UPDATE backtests SET invalidated_at=COALESCE(invalidated_at,?),invalidation_reason=COALESCE(invalidation_reason,'Superseded by shared validation engine with scored-window warm-up, costed benchmark, and robust metric semantics') WHERE status='COMPLETED'", (iso(),))
+            connection.execute("INSERT INTO app_metadata(key,value) VALUES('validation_engine_v1_backtests_invalidated',?)", (iso(),))
         live_columns = {row[1] for row in connection.execute("PRAGMA table_info(live_tests)").fetchall()}
         if "runtime_state" not in live_columns:
             connection.execute("ALTER TABLE live_tests ADD COLUMN runtime_state TEXT NOT NULL DEFAULT '{}'")
@@ -300,6 +312,48 @@ class SessionConfig(BaseModel):
             decimal_value(value)
         if not Decimal("0") < Decimal(self.allocation_fraction) <= Decimal("1"):
             raise ValueError("allocation_fraction must be greater than 0 and at most 1")
+        return self
+
+
+class ValidationRunInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    backtest_id: str
+    symbols: list[str] = Field(min_length=1, max_length=5)
+    timeframe: Literal["1m", "5m", "15m", "1h", "1d"]
+    period_preset: Literal["30d", "90d", "180d", "365d", "custom"] = "90d"
+    start_date: str | None = None
+    end_date: str | None = None
+    walk_forward_mode: Literal["fixed", "rolling", "expanding"] = "fixed"
+    training_days: int = Field(default=180, ge=20, le=1825)
+    testing_days: int = Field(default=30, ge=5, le=365)
+    step_days: int = Field(default=30, ge=5, le=365)
+    purge_bars: int = Field(default=1, ge=0, le=100)
+    embargo_bars: int = Field(default=1, ge=0, le=100)
+    execution_delay_bars: int = Field(default=1, ge=1, le=5)
+    fee_bps: str = "1.00"
+    spread_bps: str = "2.00"
+    slippage_bps: str = "3.00"
+    adverse_multiplier: str = "2.00"
+    severe_multiplier: str = "3.00"
+    bootstrap_samples: int = Field(default=500, ge=100, le=2000)
+    seed: int = Field(default=7, ge=0, le=2_147_483_647)
+    minimum_trades: int = Field(default=10, ge=0, le=1000)
+    maximum_drawdown_percent: str = "20.00"
+    minimum_net_return_percent: str = "0.00"
+
+    @model_validator(mode="after")
+    def valid_spec(self):
+        self.symbols = [symbol.strip().upper() for symbol in self.symbols]
+        if any(not symbol or len(symbol) > 10 or not symbol[0].isalpha() or any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-" for char in symbol) for symbol in self.symbols): raise ValueError("invalid US-equity symbol")
+        if len(set(self.symbols)) != len(self.symbols): raise ValueError("duplicate symbols")
+        for value in (self.fee_bps, self.spread_bps, self.slippage_bps, self.adverse_multiplier, self.severe_multiplier, self.maximum_drawdown_percent): decimal_value(value)
+        Decimal(self.minimum_net_return_percent)
+        if self.step_days < self.testing_days: raise ValueError("step length must be at least test length; overlapping scored windows are rejected to prevent double-counting")
+        if self.period_preset == "custom":
+            if not self.start_date or not self.end_date: raise ValueError("custom period requires start_date and end_date")
+            start, end = datetime.fromisoformat(self.start_date), datetime.fromisoformat(self.end_date)
+            if start >= end: raise ValueError("start_date must precede end_date")
+            if (end - start).days > 1825: raise ValueError("custom period cannot exceed five years")
         return self
 
 
@@ -1127,106 +1181,159 @@ def desired_position(family: str, params: dict[str, int], closes: list[Decimal],
     return True if not current and closes[index] > prior_high else False if current and closes[index] < prior_low else current
 
 
-def backtest_candidate(candidate: sqlite3.Row, config: dict[str, Any], bars: list[dict[str, Any]]) -> dict[str, Any]:
-    bars = regular_session_bars(bars, config["timeframe"])
-    if len(bars) < 2: raise ValueError("insufficient regular-session bars")
-    closes = [Decimal(bar["close"]) for bar in bars]
-    opens = [Decimal(bar["open"]) for bar in bars]
-    params = json.loads(candidate["parameters"])
-    cash = decimal_value(config["starting_capital"], positive=True)
-    starting = cash
-    fraction = decimal_value(config["allocation_fraction"], positive=True)
-    price_impact_bps = decimal_value(config["spread_bps"]) / 2 + decimal_value(config["slippage_bps"])
-    shares = Decimal("0")
-    position = False
-    pending: bool | None = None
-    entry_value = Decimal("0")
-    costs = Decimal("0")
-    turnover = Decimal("0")
-    trades: list[dict[str, Any]] = []
-    equity: list[Decimal] = []
-    drawdowns: list[Decimal] = []
-    period_returns: list[float] = []
-    peak = starting
-    days_in_market = 0
-    for i, bar in enumerate(bars):
-        # Intent from prior closed bar fills only at this bar open: no same-bar access/fill.
-        if pending is not None and pending != position:
-            raw_price = opens[i]
-            adjustment = price_impact_bps / Decimal("10000")
-            fill_price = raw_price * (Decimal("1") + adjustment if pending else Decimal("1") - adjustment)
-            if pending:
-                notional = cash * fraction
-                quantity = (notional / fill_price).quantize(Decimal("0.001"), rounding=ROUND_DOWN)
-                fee = quantity * raw_price * decimal_value(config["fee_bps"]) / Decimal("10000")
-                if quantity > 0:
-                    cash -= quantity * fill_price + fee
-                    shares = quantity
-                    entry_value = quantity * fill_price + fee
-                    costs += quantity * (fill_price - raw_price) + fee
-                    turnover += quantity * raw_price
-                    position = True
-                    trades.append({"entry_time": bar["timestamp"], "entry_price": f"{fill_price:.4f}", "quantity": f"{quantity:.3f}", "fees": f"{fee:.2f}", "exit_time": None, "exit_price": None, "net_pnl": None})
-            else:
-                fee = shares * raw_price * decimal_value(config["fee_bps"]) / Decimal("10000")
-                proceeds = shares * fill_price - fee
-                cash += proceeds
-                costs += shares * (raw_price - fill_price) + fee
-                turnover += shares * raw_price
-                if trades:
-                    trades[-1].update({"exit_time": bar["timestamp"], "exit_price": f"{fill_price:.4f}", "fees": f"{Decimal(trades[-1]['fees']) + fee:.2f}", "net_pnl": f"{proceeds - entry_value:.2f}"})
-                shares = Decimal("0")
-                position = False
-            pending = None
-        local = datetime.fromisoformat(bar["timestamp"].replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York"))
-        next_is_new_session = i == len(bars)-1 or datetime.fromisoformat(bars[i+1]["timestamp"].replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York")).date() != local.date()
-        if config["timeframe"] != "1d" and next_is_new_session and position:
-            raw_price = Decimal(bar["close"]); adjustment = price_impact_bps / Decimal("10000"); fill_price = raw_price * (Decimal("1") - adjustment)
-            fee = shares * raw_price * decimal_value(config["fee_bps"]) / Decimal("10000"); proceeds = shares * fill_price - fee
-            cash += proceeds; costs += shares * (raw_price - fill_price) + fee; turnover += shares * raw_price
-            trades[-1].update({"exit_time": bar["timestamp"], "exit_price": f"{fill_price:.4f}", "fees": f"{Decimal(trades[-1]['fees']) + fee:.2f}", "net_pnl": f"{proceeds - entry_value:.2f}"})
-            shares = Decimal("0"); position = False; pending = None
-        value = cash + shares * Decimal(bar["close"])
-        if equity:
-            period_returns.append(float(value / equity[-1] - 1))
-        equity.append(value)
+def annual_periods(timeframe: str) -> int:
+    return {"1m": 252 * 390, "5m": 252 * 78, "15m": 252 * 26, "1h": 252 * 7, "1d": 252}[timeframe]
+
+
+def completed_bars(bars: list[dict[str, Any]], timeframe: str, now: datetime | None = None) -> list[dict[str, Any]]:
+    now = now or utcnow()
+    if timeframe == "1d":
+        return [bar for bar in bars if datetime.fromisoformat(bar["timestamp"].replace("Z", "+00:00")).date() < now.date()]
+    cutoff = now - timedelta(minutes=TIMEFRAME_MINUTES[timeframe])
+    return [bar for bar in bars if datetime.fromisoformat(bar["timestamp"].replace("Z", "+00:00")) <= cutoff]
+
+
+def drawdown_details(equity: list[Decimal]) -> tuple[Decimal, int]:
+    peak = Decimal("0"); maximum = Decimal("0"); duration = longest = 0
+    for value in equity:
         peak = max(peak, value)
-        drawdowns.append((value / peak - 1) * Decimal("100"))
-        days_in_market += int(position)
-        desired = False if config["timeframe"] != "1d" and next_is_new_session else desired_position(candidate["family"], params, closes, i, position)
-        if desired != position:
-            pending = desired
-    ending = equity[-1]
+        drawdown = (value / peak - 1) * 100 if peak else Decimal("0")
+        maximum = min(maximum, drawdown)
+        duration = duration + 1 if value < peak else 0
+        longest = max(longest, duration)
+    return abs(maximum), longest
+
+
+def block_bootstrap(returns: list[float], seed: int, samples: int = 500) -> dict[str, Any]:
+    if not samples: return {"method": "not repeated for secondary scenario", "seed": seed, "samples": 0, "block_length": None, "net_return_95": None, "limitation": "Confidence interval is computed for the base holdout only."}
+    if len(returns) < 20: return {"method": "seeded moving-block bootstrap", "seed": seed, "samples": samples, "block_length": None, "net_return_95": None, "limitation": "At least 20 daily returns required."}
+    rng = random.Random(seed); n = len(returns); block = max(2, round(n ** (1 / 3))); estimates = []
+    for _ in range(samples):
+        sample = []
+        while len(sample) < n:
+            begin = rng.randrange(0, n - block + 1); sample.extend(returns[begin:begin + block])
+        value = 1.0
+        for item in sample[:n]: value *= 1 + item
+        estimates.append((value - 1) * 100)
+    estimates.sort()
+    return {"method": "seeded moving-block bootstrap", "seed": seed, "samples": samples, "block_length": block, "net_return_95": [round(estimates[int(samples * .025)], 2), round(estimates[min(samples - 1, int(samples * .975))], 2)], "limitation": "Resamples contiguous return blocks; sensitive to block length, regime shifts, and limited history."}
+
+
+def daily_compounded_returns(returns: list[float], equity_times: list[str]) -> list[float]:
+    grouped: dict[str, float] = {}
+    for value, at in zip(returns, equity_times[1:]):
+        day = datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York")).date().isoformat()
+        grouped[day] = (1 + grouped.get(day, 0.0)) * (1 + value) - 1
+    return list(grouped.values())
+
+
+def regime_results(bars: list[dict[str, Any]], returns: list[float]) -> list[dict[str, Any]]:
+    buckets: dict[str, list[float]] = {}
+    closes = [float(bar["close"]) for bar in bars]
+    for i, value in enumerate(returns, 1):
+        if i < 20: label = "insufficient warm-up"
+        else:
+            trailing = closes[max(0, i - 20):i]
+            mean = sum(trailing) / len(trailing)
+            label = "trailing uptrend" if closes[i] >= mean else "trailing downtrend"
+        buckets.setdefault(label, []).append(value)
+    result = []
+    for label, values in buckets.items():
+        compounded = 1.0
+        for value in values: compounded *= 1 + value
+        result.append({"regime": label, "bars": len(values), "return_percent": round((compounded - 1) * 100, 2)})
+    return result
+
+
+def execution_metrics(equity: list[Decimal], equity_times: list[str], trades: list[dict[str, Any]], returns: list[float], starting: Decimal, turnover: Decimal, costs: Decimal, exposure_bars: int, timeframe: str, benchmark_return: Decimal | None, seed: int, bootstrap_samples: int) -> dict[str, Any]:
+    ending = equity[-1] if equity else starting
     net_return = (ending / starting - 1) * 100
-    benchmark = (closes[-1] / closes[0] - 1) * 100
-    maximum_drawdown = abs(min(drawdowns, default=Decimal("0")))
-    closed = [trade for trade in trades if trade["net_pnl"] is not None]
+    maximum_drawdown, drawdown_bars = drawdown_details(equity)
+    mean = statistics.mean(returns) if returns else None
+    stdev = statistics.stdev(returns) if len(returns) > 1 else None
+    downside = [min(item, 0) for item in returns]
+    downside_dev = math.sqrt(sum(item * item for item in downside) / len(downside)) if downside else None
+    periods = annual_periods(timeframe)
+    volatility = stdev * math.sqrt(periods) * 100 if stdev is not None else None
+    sharpe = mean / stdev * math.sqrt(periods) if mean is not None and stdev else None
+    sortino = mean / downside_dev * math.sqrt(periods) if mean is not None and downside_dev else None
+    closed = [trade for trade in trades if trade.get("net_pnl") is not None]
     wins = [Decimal(trade["net_pnl"]) for trade in closed if Decimal(trade["net_pnl"]) > 0]
     losses = [Decimal(trade["net_pnl"]) for trade in closed if Decimal(trade["net_pnl"]) < 0]
-    mean = statistics.mean(period_returns) if period_returns else 0
-    stdev = statistics.stdev(period_returns) if len(period_returns) > 1 else 0
-    downside = [min(item, 0) for item in period_returns]
-    downside_dev = math.sqrt(sum(item * item for item in downside) / len(downside)) if downside else 0
-    annual_periods = {"1m": 252 * 390, "5m": 252 * 78, "15m": 252 * 26, "1h": 252 * 7, "1d": 252}[config["timeframe"]]
-    sharpe = mean / stdev * math.sqrt(annual_periods) if stdev else None
-    sortino = mean / downside_dev * math.sqrt(annual_periods) if downside_dev else None
-    warnings = ["Alpaca historical bars; provider feed, retrieval time, and content hash are frozen with this result.", "Next-bar-open fills use disclosed costs, not queue position or broker parity.", "Final holdout is excluded from selection ranking and remains locked.", "Multiple testing can inflate apparent performance."]
-    if len(closed) < config["minimum_trade_count"]:
-        warnings.append("Trade count below configured minimum; ratios are unstable.")
-    metrics = {
-        "net_return_percent": round(float(net_return), 2), "benchmark_return_percent": round(float(benchmark), 2),
-        "maximum_drawdown_percent": round(float(maximum_drawdown), 2), "worst_day_percent": round(min(period_returns, default=0) * 100, 2),
+    pnls = [Decimal(trade["net_pnl"]) for trade in closed]
+    calendar_days = (datetime.fromisoformat(equity_times[-1].replace("Z", "+00:00")) - datetime.fromisoformat(equity_times[0].replace("Z", "+00:00"))).total_seconds() / 86400 if len(equity_times) > 1 else 0
+    cagr = ((float(ending / starting) ** (365.25 / calendar_days) - 1) * 100) if calendar_days >= 30 and ending > 0 else None
+    best_trade_share = float(sum(sorted(wins, reverse=True)[:max(1, math.ceil(len(wins) * .1))]) / sum(wins) * 100) if wins and sum(wins) else None
+    daily_returns = daily_compounded_returns(returns, equity_times)
+    positive_returns = [value for value in daily_returns if value > 0]
+    best_day_share = sum(sorted(positive_returns, reverse=True)[:max(1, math.ceil(len(positive_returns) * .1))]) / sum(positive_returns) * 100 if positive_returns and sum(positive_returns) else None
+    return {
+        "net_return_percent": round(float(net_return), 2), "cagr_percent": round(cagr, 2) if cagr is not None else None,
+        "annualized_volatility_percent": round(volatility, 2) if volatility is not None else None,
         "sharpe": round(sharpe, 2) if sharpe is not None else None, "sortino": round(sortino, 2) if sortino is not None else None,
+        "maximum_drawdown_percent": round(float(maximum_drawdown), 2), "maximum_drawdown_duration_bars": drawdown_bars,
+        "trade_count": len(closed), "win_rate_percent": round(len(wins) / len(closed) * 100, 2) if closed else None,
         "profit_factor": round(float(sum(wins) / abs(sum(losses))), 2) if losses else None,
-        "win_rate_percent": round(len(wins) / len(closed) * 100, 2) if closed else None,
-        "average_win": f"{sum(wins) / len(wins):.2f}" if wins else None, "average_loss": f"{sum(losses) / len(losses):.2f}" if losses else None,
-        "trade_count": len(closed), "turnover_percent": round(float(turnover / starting * 100), 2),
-        "exposure_percent": round(days_in_market / len(bars) * 100, 2), "time_in_market_percent": round(days_in_market / len(bars) * 100, 2),
-        "costs": f"{costs:.2f}", "ending_equity": f"{ending:.2f}",
-        "validation_stability": "Insufficient evidence" if len(closed) < max(config["minimum_trade_count"], 5) else "Needs walk-forward review",
+        "expectancy": f"{sum(pnls) / len(pnls):.2f}" if pnls else None,
+        "average_holding_period_bars": round(sum(int(trade.get("holding_bars", 0)) for trade in closed) / len(closed), 2) if closed else None,
+        "exposure_percent": round(exposure_bars / len(equity) * 100, 2) if equity else None,
+        "turnover_percent": round(float(turnover / starting * 100), 2), "costs": f"{costs:.2f}", "ending_equity": f"{ending:.2f}",
+        "benchmark_return_percent": round(float(benchmark_return), 2) if benchmark_return is not None else None, "cash_return_percent": 0.0,
+        "best_10_percent_trades_profit_concentration_percent": round(best_trade_share, 2) if best_trade_share is not None else None,
+        "best_10_percent_positive_days_concentration_percent": round(best_day_share, 2) if best_day_share is not None else None,
+        "bootstrap": block_bootstrap(daily_returns, seed, bootstrap_samples),
     }
-    return {"metrics": metrics, "equity_curve": [round(float(v), 2) for v in equity], "drawdown_curve": [round(float(v), 2) for v in drawdowns], "trades": trades, "warnings": warnings}
 
+
+def evaluate_strategy(candidate: sqlite3.Row | dict[str, Any], config: dict[str, Any], bars: list[dict[str, Any]], *, score_start: int = 0, score_end: int | None = None, execution_delay_bars: int = 1, seed: int = 7, bootstrap_samples: int = 500, parameters: dict[str, int] | None = None) -> dict[str, Any]:
+    if candidate["family"] not in TEMPLATES: raise ValueError("unknown or unreviewed strategy family")
+    if execution_delay_bars < 1 or execution_delay_bars > 5: raise ValueError("execution delay must be 1..5 bars")
+    bars = regular_session_bars(bars, config["timeframe"]); score_end = min(score_end or len(bars), len(bars))
+    if score_start < 0 or score_start >= score_end or score_end - score_start < 2: raise ValueError("insufficient scored bars")
+    closes = [Decimal(bar["close"]) for bar in bars]; opens = [Decimal(bar["open"]) for bar in bars]
+    params = parameters or json.loads(candidate["parameters"]); starting = decimal_value(config["starting_capital"], positive=True); cash = starting
+    fraction = decimal_value(config["allocation_fraction"], positive=True); price_impact_bps = decimal_value(config["spread_bps"]) / 2 + decimal_value(config["slippage_bps"]); fee_bps = decimal_value(config["fee_bps"])
+    shares = Decimal("0"); position = False; pending: tuple[bool, int] | None = None; entry_value = Decimal("0"); entry_index = 0
+    costs = Decimal("0"); turnover = Decimal("0"); trades = []; equity = []; equity_times = []; returns = []; exposure_bars = 0
+    for i, bar in enumerate(bars[:score_end]):
+        if i < score_start:
+            desired_position(candidate["family"], params, closes, i, False)
+            continue
+        if pending is not None and pending[1] <= i and pending[0] != position:
+            target = pending[0]; raw_price = opens[i]; impact = price_impact_bps / Decimal("10000"); fill_price = raw_price * (1 + impact if target else 1 - impact)
+            if target:
+                quantity = (cash * fraction / (fill_price * (1 + fee_bps / Decimal("10000")))).quantize(Decimal("0.001"), rounding=ROUND_DOWN); fee = quantity * raw_price * fee_bps / Decimal("10000")
+                if quantity > 0:
+                    cash -= quantity * fill_price + fee; shares = quantity; entry_value = quantity * fill_price + fee; entry_index = i; costs += quantity * abs(fill_price - raw_price) + fee; turnover += quantity * raw_price; position = True
+                    trades.append({"entry_time": bar["timestamp"], "entry_price": f"{fill_price:.4f}", "quantity": f"{quantity:.3f}", "fees": f"{fee:.2f}", "exit_time": None, "exit_price": None, "net_pnl": None})
+            elif shares:
+                fee = shares * raw_price * fee_bps / Decimal("10000"); proceeds = shares * fill_price - fee; cash += proceeds; costs += shares * abs(raw_price - fill_price) + fee; turnover += shares * raw_price
+                trades[-1].update({"exit_time": bar["timestamp"], "exit_price": f"{fill_price:.4f}", "fees": f"{Decimal(trades[-1]['fees']) + fee:.2f}", "net_pnl": f"{proceeds - entry_value:.2f}", "holding_bars": i - entry_index}); shares = Decimal("0"); position = False
+            pending = None
+        local = datetime.fromisoformat(bar["timestamp"].replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York")); next_is_new_session = i == score_end - 1 or datetime.fromisoformat(bars[i + 1]["timestamp"].replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York")).date() != local.date()
+        if config["timeframe"] != "1d" and next_is_new_session and position:
+            raw_price = Decimal(bar["close"]); impact = price_impact_bps / Decimal("10000"); fill_price = raw_price * (1 - impact); fee = shares * raw_price * fee_bps / Decimal("10000"); proceeds = shares * fill_price - fee; cash += proceeds; costs += shares * abs(raw_price - fill_price) + fee; turnover += shares * raw_price
+            trades[-1].update({"exit_time": bar["timestamp"], "exit_price": f"{fill_price:.4f}", "fees": f"{Decimal(trades[-1]['fees']) + fee:.2f}", "net_pnl": f"{proceeds - entry_value:.2f}", "holding_bars": i - entry_index}); shares = Decimal("0"); position = False; pending = None
+        value = cash + shares * closes[i]
+        if equity: returns.append(float(value / equity[-1] - 1))
+        equity.append(value); equity_times.append(bar["timestamp"]); exposure_bars += int(position)
+        desired = False if config["timeframe"] != "1d" and next_is_new_session else desired_position(candidate["family"], params, closes, i, position)
+        if desired != position: pending = (desired, i + execution_delay_bars)
+    if position:
+        raw_price = closes[score_end - 1]; impact = price_impact_bps / Decimal("10000"); fill_price = raw_price * (1 - impact); fee = shares * raw_price * fee_bps / Decimal("10000"); proceeds = shares * fill_price - fee; cash += proceeds; costs += shares * abs(raw_price - fill_price) + fee; turnover += shares * raw_price
+        trades[-1].update({"exit_time": bars[score_end - 1]["timestamp"], "exit_price": f"{fill_price:.4f}", "fees": f"{Decimal(trades[-1]['fees']) + fee:.2f}", "net_pnl": f"{proceeds - entry_value:.2f}", "holding_bars": score_end - 1 - entry_index}); equity[-1] = cash
+        if len(equity) > 1: returns[-1] = float(equity[-1] / equity[-2] - 1)
+    impact = price_impact_bps / Decimal("10000"); first_open = opens[score_start]; last_close = closes[score_end - 1]; benchmark_qty = (starting / (first_open * (1 + impact) * (1 + fee_bps / 10000))).quantize(Decimal("0.001"), rounding=ROUND_DOWN)
+    benchmark_ending = starting - benchmark_qty * first_open * (1 + impact) - benchmark_qty * first_open * fee_bps / 10000 + benchmark_qty * last_close * (1 - impact) - benchmark_qty * last_close * fee_bps / 10000
+    benchmark_return = (benchmark_ending / starting - 1) * 100
+    metrics = execution_metrics(equity, equity_times, trades, returns, starting, turnover, costs, exposure_bars, config["timeframe"], benchmark_return, seed, bootstrap_samples)
+    metrics["validation_stability"] = "Insufficient evidence" if metrics["trade_count"] < max(config.get("minimum_trade_count", 3), 5) else "Requires independent interpretation"
+    return {"metrics": metrics, "equity_curve": [{"at": at, "value": round(float(value), 2)} for at, value in zip(equity_times, equity)], "drawdown_curve": [round(float(value / max(equity[:i + 1]) - 1) * 100, 2) for i, value in enumerate(equity)], "trades": trades, "returns": returns, "regimes": regime_results(bars[score_start:score_end], returns), "warnings": ["Signals use completed bars; fills occur no earlier than the configured later bar open.", "Fees, half-spread, and slippage are modeled once per side.", "Regular-hours calendar excludes extended hours; early-close/unscheduled closure detection is unsupported without an exchange-calendar provider.", "Liquidity, partial fills, queue position, market impact, and intrabar paths are unsupported."]}
+
+
+def backtest_candidate(candidate: sqlite3.Row, config: dict[str, Any], bars: list[dict[str, Any]]) -> dict[str, Any]:
+    result = evaluate_strategy(candidate, config, bars, seed=7)
+    return {"metrics": result["metrics"], "equity_curve": [point["value"] for point in result["equity_curve"]], "drawdown_curve": result["drawdown_curve"], "trades": result["trades"], "warnings": ["Alpaca historical bars; provider feed, retrieval time, and content hash are frozen with this result.", *result["warnings"], "Final holdout requires a separate Strategy Validation run.", "Multiple testing can inflate apparent performance."]}
 
 def run_backtests(session_id: str) -> None:
     with connect() as connection:
@@ -1300,6 +1407,133 @@ def process_due_sessions() -> int:
                 connection.execute("UPDATE research_sessions SET in_flight=0 WHERE id=?", (session["id"],))
         processed += 1
     return processed
+
+
+def validation_public(row: sqlite3.Row, *, accessed: bool = False) -> dict[str, Any]:
+    item = json_row(row, ("strategy_snapshot", "parameters_snapshot", "specification", "dataset_refs", "result", "warnings"))
+    if accessed and row["state"] == "COMPLETED":
+        with connect() as connection:
+            count = row["holdout_access_count"] + 1
+            connection.execute("UPDATE validation_runs SET holdout_access_count=?,holdout_compromised=? WHERE id=?", (count, int(count > 1), row["id"]))
+        item["holdout_access_count"], item["holdout_compromised"] = count, int(count > 1)
+    return item
+
+
+def date_period(spec: dict[str, Any]) -> tuple[str, str]:
+    end = datetime.fromisoformat(spec["end_date"]).date() if spec.get("period_preset") == "custom" else utcnow().date()
+    days = int(spec["period_preset"][:-1]) if spec.get("period_preset") != "custom" else (end - datetime.fromisoformat(spec["start_date"]).date()).days
+    start = datetime.fromisoformat(spec["start_date"]).date() if spec.get("period_preset") == "custom" else end - timedelta(days=days)
+    return start.isoformat(), end.isoformat()
+
+
+def expected_bar_count(start: str, end: str, timeframe: str) -> int:
+    weekdays = sum(1 for offset in range((datetime.fromisoformat(end).date() - datetime.fromisoformat(start).date()).days + 1) if (datetime.fromisoformat(start).date() + timedelta(days=offset)).weekday() < 5)
+    return weekdays * {"1m": 390, "5m": 78, "15m": 26, "1h": 7, "1d": 1}[timeframe]
+
+
+def bar_gap_count(bars: list[dict[str, Any]], timeframe: str) -> int:
+    if len(bars) < 2: return 0
+    eastern = ZoneInfo("America/New_York"); expected = timedelta(minutes=TIMEFRAME_MINUTES[timeframe]); gaps = 0
+    for previous, current in zip(bars, bars[1:]):
+        left = datetime.fromisoformat(previous["timestamp"].replace("Z", "+00:00")); right = datetime.fromisoformat(current["timestamp"].replace("Z", "+00:00"))
+        if left.astimezone(eastern).date() == right.astimezone(eastern).date() and right - left > expected: gaps += max(0, round((right - left) / expected) - 1)
+    return gaps
+
+
+def cached_or_fetch(symbol: str, timeframe: str, start: str, end: str) -> tuple[list[dict[str, Any]], str, str, bool]:
+    with connect() as connection:
+        cached = connection.execute("SELECT * FROM market_datasets WHERE instrument=? AND timeframe=? AND start_at=? AND end_at=? ORDER BY created_at DESC LIMIT 1", (symbol, timeframe, start, end)).fetchone()
+    if cached:
+        bars = json.loads(cached["bars"]); return bars, cached["feed"], cached["id"], True
+    bars, feed = fetch_alpaca_bars(symbol, timeframe, start, end); bars = completed_bars(bars, timeframe)
+    if len(bars) < 2: raise HTTPException(422, f"No sufficient completed bars for {symbol}")
+    content_hash = digest(bars); dataset_id = f"VALIDATION-{symbol}-{timeframe}-{content_hash[:16]}"
+    with connect() as connection: connection.execute("INSERT OR IGNORE INTO market_datasets VALUES(?,?,?,?,?,?,?,?,?,?)", (dataset_id, "alpaca", symbol, timeframe, start, end, feed, canonical(bars), content_hash, iso()))
+    return bars, feed, dataset_id, False
+
+
+def nearby_parameters(family: str, params: dict[str, int]) -> list[dict[str, int]]:
+    result = []
+    for key, value in params.items():
+        for multiplier in (.8, 1.2):
+            candidate = dict(params); candidate[key] = max(2, round(value * multiplier))
+            if family == "moving_average" and candidate["fast"] >= candidate["slow"]: continue
+            if family == "rsi" and candidate["entry"] >= candidate["exit"]: continue
+            if family == "channel_breakout" and candidate["exit"] >= candidate["lookback"]: continue
+            if candidate not in result: result.append(candidate)
+    return result[:6]
+
+
+def process_validation_run(run_id: str) -> None:
+    with connect() as connection:
+        changed = connection.execute("UPDATE validation_runs SET state='RUNNING',progress=5,started_at=? WHERE id=? AND state='PENDING'", (iso(), run_id)).rowcount
+        row = connection.execute("SELECT v.*,c.family,b.assumptions AS original_assumptions,b.metrics AS original_metrics,b.invalidated_at FROM validation_runs v JOIN candidates c ON c.id=v.candidate_id JOIN backtests b ON b.id=v.backtest_id WHERE v.id=?", (run_id,)).fetchone()
+    if not changed or not row: return
+    spec, params = json.loads(row["specification"]), json.loads(row["parameters_snapshot"]); warnings = json.loads(row["warnings"])
+    try:
+        start, end = date_period(spec); dataset_refs = []; symbol_results = []
+        for index, symbol in enumerate(spec["symbols"]):
+            with connect() as connection:
+                if connection.execute("SELECT cancellation_requested FROM validation_runs WHERE id=?", (run_id,)).fetchone()[0]:
+                    connection.execute("UPDATE validation_runs SET state='CANCELED',error='Canceled by user',completed_at=? WHERE id=?", (iso(), run_id)); return
+            per_day = {"1m": 390, "5m": 78, "15m": 26, "1h": 7, "1d": 1}[spec["timeframe"]]
+            warmup_days = max(5, math.ceil(max(params.values()) / per_day) * 2)
+            fetch_start = (datetime.fromisoformat(start).date() - timedelta(days=warmup_days)).isoformat()
+            bars, feed, dataset_id, cache_hit = cached_or_fetch(symbol, spec["timeframe"], fetch_start, end)
+            regular = regular_session_bars(bars, spec["timeframe"]); expected = expected_bar_count(start, end, spec["timeframe"]); last_bar = regular[-1]["timestamp"]
+            score_start = next((i for i, bar in enumerate(regular) if datetime.fromisoformat(bar["timestamp"].replace("Z", "+00:00")).date() >= datetime.fromisoformat(start).date()), len(regular))
+            if score_start >= len(regular) - 1: raise HTTPException(422, f"Insufficient scored coverage for {symbol}")
+            scored_count = len(regular) - score_start
+            quality = {"provider": "alpaca", "feed": feed, "entitlement": "configured account entitlement; IEX/SIP coverage differs", "timezone": "America/New_York sessions; UTC storage", "adjustment": "all", "requested_start": start, "requested_end": end, "fetch_start_with_warmup": fetch_start, "actual_start": regular[score_start]["timestamp"], "actual_end": last_bar, "last_completed_bar": last_bar, "bars": scored_count, "warmup_bars": score_start, "expected_weekday_bars": expected, "missing_or_calendar_difference_bars": max(0, expected - scored_count), "detected_intraday_gap_bars": bar_gap_count(regular[score_start:], spec["timeframe"]), "coverage_percent": round(min(100, scored_count / expected * 100), 2) if expected else None, "freshness_seconds": max(0, round((utcnow() - datetime.fromisoformat(last_bar.replace("Z", "+00:00"))).total_seconds())), "cache_hit": cache_hit, "limitations": ["Weekday expectation does not encode exchange holidays or early closes.", "Provider entitlement/rate/history limits may reduce coverage; no synthetic substitution."]}
+            dataset_refs.append({"symbol": symbol, "dataset_id": dataset_id, "fingerprint": digest(regular), "quality": quality})
+            original = json.loads(row["original_assumptions"]); config = {**original, **{key: spec[key] for key in ("fee_bps", "spread_bps", "slippage_bps")}, "timeframe": spec["timeframe"], "starting_capital": original["starting_capital"], "allocation_fraction": "0.25", "minimum_trade_count": spec["minimum_trades"]}
+            candidate = {"family": row["family"], "parameters": canonical(params)}
+            warmup = max(params.values()) + spec["purge_bars"]
+            if score_start < warmup: warnings.append(f"{symbol}: available pre-period warm-up was shorter than the indicator lookback.")
+            base = evaluate_strategy(candidate, config, regular, score_start=score_start, execution_delay_bars=spec["execution_delay_bars"], seed=spec["seed"], bootstrap_samples=spec["bootstrap_samples"])
+            stresses = []
+            for label, multiplier in (("base", Decimal("1")), ("adverse", Decimal(spec["adverse_multiplier"])), ("severe", Decimal(spec["severe_multiplier"]))):
+                stressed = {**config, "fee_bps": str(Decimal(spec["fee_bps"]) * multiplier), "spread_bps": str(Decimal(spec["spread_bps"]) * multiplier), "slippage_bps": str(Decimal(spec["slippage_bps"]) * multiplier)}
+                result = evaluate_strategy(candidate, stressed, regular, score_start=score_start, execution_delay_bars=spec["execution_delay_bars"], seed=spec["seed"], bootstrap_samples=0)
+                stresses.append({"scenario": label, "multiplier": str(multiplier), "metrics": result["metrics"]})
+            sensitivity = []
+            for nearby in nearby_parameters(row["family"], params):
+                result = evaluate_strategy(candidate, config, regular, score_start=score_start, execution_delay_bars=spec["execution_delay_bars"], seed=spec["seed"], bootstrap_samples=0, parameters=nearby)
+                sensitivity.append({"parameters": nearby, "metrics": result["metrics"]})
+            delays = [{"delay_bars": delay, "metrics": evaluate_strategy(candidate, config, regular, score_start=score_start, execution_delay_bars=delay, seed=spec["seed"], bootstrap_samples=0)["metrics"]} for delay in sorted({1, spec["execution_delay_bars"], min(5, spec["execution_delay_bars"] + 1)})]
+            windows = []
+            if spec["walk_forward_mode"] != "fixed":
+                per_day = {"1m": 390, "5m": 78, "15m": 26, "1h": 7, "1d": 1}[spec["timeframe"]]; train = spec["training_days"] * per_day; test = spec["testing_days"] * per_day; step = spec["step_days"] * per_day; cursor = train
+                while cursor + spec["embargo_bars"] + test <= len(regular) and len(windows) < 50:
+                    test_start = cursor + spec["embargo_bars"]; window_end = test_start + test
+                    result = evaluate_strategy(candidate, config, regular, score_start=test_start, score_end=window_end, execution_delay_bars=spec["execution_delay_bars"], seed=spec["seed"], bootstrap_samples=0)
+                    windows.append({"index": len(windows)+1, "mode": spec["walk_forward_mode"], "training_start": regular[0 if spec["walk_forward_mode"] == "expanding" else max(0, cursor-train)]["timestamp"], "training_end": regular[max(0, cursor-spec["purge_bars"]-1)]["timestamp"], "test_start": regular[test_start]["timestamp"], "test_end": regular[window_end-1]["timestamp"], "purge_bars": spec["purge_bars"], "embargo_bars": spec["embargo_bars"], "parameters_frozen": params, "metrics": result["metrics"], "equity_curve": result["equity_curve"]}); cursor += step
+            criteria = {"minimum_trades": base["metrics"]["trade_count"] >= spec["minimum_trades"], "maximum_drawdown": base["metrics"]["maximum_drawdown_percent"] <= float(spec["maximum_drawdown_percent"]), "minimum_net_return": base["metrics"]["net_return_percent"] >= float(spec["minimum_net_return_percent"])}
+            assessment = "insufficient evidence" if base["metrics"]["trade_count"] < spec["minimum_trades"] or len(regular) < 30 else "meets configured criteria" if all(criteria.values()) else "does not meet configured criteria"
+            symbol_results.append({"symbol": symbol, "assessment": assessment, "criteria": criteria, "base": base, "stress": stresses, "sensitivity": sensitivity, "delays": delays, "walk_forward": windows})
+            with connect() as connection: connection.execute("UPDATE validation_runs SET progress=? WHERE id=?", (20 + round((index + 1) / len(spec["symbols"]) * 70), run_id))
+        original_metrics = json.loads(row["original_metrics"] or "{}"); first = symbol_results[0]["base"]["metrics"]
+        comparison = {key: {"original": original_metrics.get(key), "recent": first.get(key), "change": round(first[key] - original_metrics[key], 2) if isinstance(first.get(key), (int, float)) and isinstance(original_metrics.get(key), (int, float)) else None} for key in ("net_return_percent", "maximum_drawdown_percent", "sharpe", "trade_count", "exposure_percent", "turnover_percent")}
+        result = {"period": {"start": start, "end": end}, "symbols": symbol_results, "original_comparison": comparison, "combined_oos_equity_curve": [point for symbol in symbol_results for window in symbol["walk_forward"] for point in window["equity_curve"]], "metric_definitions": {"returns": "Compounded scored-bar portfolio returns after modeled costs.", "cagr": "Annualized geometric return only when scored span is at least 30 calendar days.", "volatility": "Sample standard deviation of scored-bar returns, annualized by timeframe.", "sharpe": "Mean scored-bar excess return divided by sample deviation; zero risk-free rate.", "sortino": "Mean scored-bar excess return divided by RMS nonpositive returns; zero risk-free rate.", "cash": "Zero return, explicitly excluding interest.", "undefined": "Unavailable where observations/denominators are insufficient; never replaced by zero."}}
+        with connect() as connection:
+            connection.execute("UPDATE validation_runs SET state='COMPLETED',progress=100,dataset_refs=?,result=?,warnings=?,completed_at=? WHERE id=?", (canonical(dataset_refs), canonical(result), canonical(warnings), iso(), run_id))
+            for ref in dataset_refs: connection.execute("INSERT INTO strategy_period_uses VALUES(?,?,?,?,?,?,?)", (str(uuid.uuid4()), row["candidate_id"], run_id, "final_holdout", start, end, iso()))
+        audit("validation.completed", "validation_run", run_id, {"datasets": [ref["fingerprint"] for ref in dataset_refs]})
+    except Exception as exc:
+        with connect() as connection: connection.execute("UPDATE validation_runs SET state='FAILED',error=?,completed_at=? WHERE id=?", (str(exc.detail if isinstance(exc, HTTPException) else exc)[:1000], iso(), run_id))
+        audit("validation.failed", "validation_run", run_id, {"error": str(exc)[:200]})
+
+
+def process_validation_jobs() -> int:
+    with connect() as connection:
+        jobs = connection.execute("SELECT * FROM jobs WHERE kind='strategy_validation' AND state='PENDING' AND due_at<=? ORDER BY created_at LIMIT 1", (iso(),)).fetchall()
+    for job in jobs:
+        with connect() as connection: connection.execute("UPDATE jobs SET state='RUNNING',attempts=attempts+1,updated_at=? WHERE id=?", (iso(), job["id"]))
+        process_validation_run(job["resource_id"])
+        with connect() as connection:
+            state = connection.execute("SELECT state FROM validation_runs WHERE id=?", (job["resource_id"],)).fetchone()[0]
+            connection.execute("UPDATE jobs SET state=?,updated_at=? WHERE id=?", ("COMPLETED" if state == "COMPLETED" else state, iso(), job["id"]))
+    return len(jobs)
 
 
 def compact_live_logs(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1493,6 +1727,7 @@ async def scheduler(stop: asyncio.Event) -> None:
         processed = 0
         try:
             processed = await asyncio.to_thread(process_due_sessions)
+            processed += await asyncio.to_thread(process_validation_jobs)
             await asyncio.to_thread(process_watchlist)
             await asyncio.to_thread(process_live_tests)
             await asyncio.to_thread(process_paper_automation)
@@ -1844,6 +2079,74 @@ def run_due_for_local_testing():
     if os.getenv("ENABLE_INTERNAL_TEST_ROUTES", "false").lower() != "true":
         raise HTTPException(404, "Not found")
     return {"processed": process_due_sessions()}
+
+
+@app.get("/api/validations")
+def list_validations():
+    with connect() as connection: rows = connection.execute("SELECT * FROM validation_runs ORDER BY created_at DESC").fetchall()
+    return [validation_public(row) for row in rows]
+
+
+@app.post("/api/validations")
+def create_validation(value: ValidationRunInput):
+    with connect() as connection:
+        backtest = connection.execute("SELECT b.*,c.source,c.source_hash,c.parameters,c.family,c.created_at AS strategy_created_at FROM backtests b JOIN candidates c ON c.id=b.candidate_id WHERE b.id=?", (value.backtest_id,)).fetchone()
+    if not backtest: raise HTTPException(404, "Backtest not found")
+    for symbol in value.symbols: validate_alpaca_equity_symbol(symbol)
+    spec = value.model_dump(mode="json"); start, end = date_period(spec); original = json.loads(backtest["assumptions"])
+    development_cutoff = original.get("historical_end")
+    with connect() as connection:
+        overlaps = connection.execute("SELECT purpose,start_at,end_at FROM strategy_period_uses WHERE candidate_id=? AND NOT(end_at<? OR start_at>?)", (backtest["candidate_id"], start, end)).fetchall()
+    warnings = ["Research-only evaluation. Historical performance does not prove future profitability.", "Fixed parameters are frozen before evaluation; holdout results never auto-select a variant.", "Recent period provenance is unverified out-of-sample." if not development_cutoff else f"Development/tuning cutoff recorded as {development_cutoff}."]
+    if overlaps: warnings.append("Selected period overlaps previously evaluated data; this is not independent unseen evidence.")
+    run_id, job_id, now = str(uuid.uuid4()), str(uuid.uuid4()), iso()
+    strategy_snapshot = {"family": backtest["family"], "source": backtest["source"], "source_hash": backtest["source_hash"], "tested_candidates_at_creation": len({(use["purpose"], use["start_at"], use["end_at"]) for use in overlaps}) + 1, "parameter_variants_in_source_session": None}
+    with connect() as connection: strategy_snapshot["parameter_variants_in_source_session"] = connection.execute("SELECT COUNT(*) FROM candidates WHERE session_id=?", (backtest["session_id"],)).fetchone()[0]
+    with connect() as connection:
+        connection.execute("INSERT INTO validation_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (run_id, backtest["id"], backtest["candidate_id"], backtest["source_hash"], canonical(strategy_snapshot), backtest["parameters"], development_cutoff, "PENDING", 0, canonical(spec), digest(spec), "[]", ENGINE_VERSION, ENGINE_HASH, value.seed, None, canonical(warnings), None, 0, 0, 0, now, None, None))
+        connection.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (job_id, "strategy_validation", run_id, f"validation:{run_id}", "PENDING", now, None, None, 0, "{}", None, now, now))
+    audit("validation.created", "validation_run", run_id, {"specification_hash": digest(spec), "strategy_hash": backtest["source_hash"], "period": [start, end]})
+    return get_validation(run_id)
+
+
+@app.get("/api/validations/{run_id}")
+def get_validation(run_id: str):
+    with connect() as connection: row = connection.execute("SELECT * FROM validation_runs WHERE id=?", (run_id,)).fetchone()
+    if not row: raise HTTPException(404, "Validation run not found")
+    return validation_public(row, accessed=False)
+
+
+@app.post("/api/validations/{run_id}/acknowledge-holdout")
+def acknowledge_validation_holdout(run_id: str):
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM validation_runs WHERE id=? AND state='COMPLETED'", (run_id,)).fetchone()
+        if not row: raise HTTPException(404, "Completed validation run not found")
+        count = row["holdout_access_count"] + 1
+        connection.execute("UPDATE validation_runs SET holdout_access_count=?,holdout_compromised=? WHERE id=?", (count, int(count > 1), run_id))
+    audit("validation.holdout_viewed", "validation_run", run_id, {"access_count": count, "independence_compromised": count > 1})
+    with connect() as connection: return validation_public(connection.execute("SELECT * FROM validation_runs WHERE id=?", (run_id,)).fetchone())
+
+
+@app.post("/api/validations/{run_id}/cancel")
+def cancel_validation(run_id: str):
+    with connect() as connection:
+        row = connection.execute("SELECT state FROM validation_runs WHERE id=?", (run_id,)).fetchone()
+        if not row: raise HTTPException(404, "Validation run not found")
+        if row["state"] in {"COMPLETED", "FAILED", "CANCELED"}: raise HTTPException(409, "Validation run already terminal")
+        connection.execute("UPDATE validation_runs SET cancellation_requested=1,state=CASE WHEN state='PENDING' THEN 'CANCELED' ELSE state END,error=CASE WHEN state='PENDING' THEN 'Canceled by user' ELSE error END,completed_at=CASE WHEN state='PENDING' THEN ? ELSE completed_at END WHERE id=?", (iso(), run_id))
+        connection.execute("UPDATE jobs SET state='CANCELED',updated_at=? WHERE resource_id=? AND state='PENDING'", (iso(), run_id))
+    audit("validation.canceled", "validation_run", run_id, {})
+    return get_validation(run_id)
+
+
+@app.get("/api/validations/{run_id}/export")
+def export_validation(run_id: str, format: Literal["json", "csv"] = "json"):
+    item = get_validation(run_id)
+    if format == "json": return item
+    lines = ["symbol,assessment,net_return_percent,benchmark_return_percent,max_drawdown_percent,trade_count,exposure_percent,turnover_percent"]
+    for symbol in (item.get("result") or {}).get("symbols", []):
+        metrics = symbol["base"]["metrics"]; lines.append(",".join(str(value) for value in (symbol["symbol"], symbol["assessment"], metrics["net_return_percent"], metrics["benchmark_return_percent"], metrics["maximum_drawdown_percent"], metrics["trade_count"], metrics["exposure_percent"], metrics["turnover_percent"])))
+    return Response("\n".join(lines), media_type="text/csv", headers={"content-disposition": f'attachment; filename="validation-{run_id}.csv"'})
 
 
 @app.get("/api/backtests")

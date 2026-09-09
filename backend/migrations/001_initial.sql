@@ -155,6 +155,43 @@ CREATE TABLE IF NOT EXISTS strategy_reviews (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS validation_runs (
+  id TEXT PRIMARY KEY,
+  backtest_id TEXT NOT NULL REFERENCES backtests(id),
+  candidate_id TEXT NOT NULL REFERENCES candidates(id),
+  strategy_hash TEXT NOT NULL,
+  strategy_snapshot TEXT NOT NULL,
+  parameters_snapshot TEXT NOT NULL,
+  development_cutoff TEXT,
+  state TEXT NOT NULL,
+  progress INTEGER NOT NULL DEFAULT 0,
+  specification TEXT NOT NULL,
+  specification_hash TEXT NOT NULL,
+  dataset_refs TEXT NOT NULL DEFAULT '[]',
+  engine_version TEXT NOT NULL,
+  engine_hash TEXT NOT NULL,
+  seed INTEGER NOT NULL,
+  result TEXT,
+  warnings TEXT NOT NULL DEFAULT '[]',
+  error TEXT,
+  cancellation_requested INTEGER NOT NULL DEFAULT 0,
+  holdout_access_count INTEGER NOT NULL DEFAULT 0,
+  holdout_compromised INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS strategy_period_uses (
+  id TEXT PRIMARY KEY,
+  candidate_id TEXT NOT NULL REFERENCES candidates(id),
+  validation_run_id TEXT REFERENCES validation_runs(id),
+  purpose TEXT NOT NULL,
+  start_at TEXT NOT NULL,
+  end_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS live_tests (
   id TEXT PRIMARY KEY,
   backtest_id TEXT NOT NULL REFERENCES backtests(id),
@@ -282,6 +319,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_state_next ON research_sessions(state,ne
 CREATE INDEX IF NOT EXISTS idx_candidates_session ON candidates(session_id,ordinal);
 CREATE INDEX IF NOT EXISTS idx_backtests_session ON backtests(session_id,status);
 CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(state,due_at);
+CREATE INDEX IF NOT EXISTS idx_validation_runs_state ON validation_runs(state,created_at);
+CREATE INDEX IF NOT EXISTS idx_strategy_period_uses ON strategy_period_uses(candidate_id,start_at,end_at);
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_events(at);
 CREATE INDEX IF NOT EXISTS idx_paper_sessions_state ON paper_sessions(state,approval_expires_at);
 CREATE INDEX IF NOT EXISTS idx_paper_orders_session ON paper_orders(paper_session_id,created_at);

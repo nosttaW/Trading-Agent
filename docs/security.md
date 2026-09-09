@@ -13,7 +13,8 @@
 - SQLite transitions commit transactionally. UTC timestamps. Decimal used for financial accounting/fills.
 - Audit records form an application-level SHA-256 chain.
 - CORS origin restricted by deployment setting. No telemetry.
-- Broker submission function absent. `/api/orders` fails `403`. Paper/live status stays disabled.
+- Validation APIs inherit authentication and CSRF middleware, validate bounded Pydantic specifications, reuse reviewed templates only, persist JSON (never pickle), and audit creation/completion/cancellation/holdout access. Validation never receives broker clients or order submission functions.
+- Real-money broker submission remains absent. `/api/orders` fails `403`; Alpaca paper routing is isolated behind explicit paper approvals.
 
 ## Deliberately disabled
 

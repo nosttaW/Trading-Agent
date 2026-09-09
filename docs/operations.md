@@ -103,4 +103,4 @@ Never auto-update while any future execution mode is active. Future deployment m
 
 ## Monitoring
 
-Poll `/api/health` for process health; `/api/readiness` for DB access. Monitor container restarts, disk space, HTTP 5xx, scheduler lag (`next_run_at`), failed/invalid candidates, failed backtests, stale live-data tests, audit-write failures. Current app has no Prometheus endpoint or alert manager; production deployment requires both.
+Poll `/api/health` for process health; `/api/readiness` for DB access. Monitor container restarts, disk space, HTTP 5xx, scheduler lag (`next_run_at`), failed/invalid candidates, failed backtests, stale live-data tests, validation jobs stuck in `PENDING`/`RUNNING`, failed validation data coverage, audit-write failures. Current app has no Prometheus endpoint or alert manager; production deployment requires both.

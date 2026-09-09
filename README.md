@@ -83,6 +83,10 @@ AI output is schema-validated. It may select one of three reviewed templates and
 
 Backtesting is a custom deterministic engine rather than a third-party library. Reason: required shared reviewed-template semantics, exact next-event timing, narrow initial scope, zero extra engine. Limit: not a general-purpose institutional simulator. Details: [`docs/strategy-interface.md`](docs/strategy-interface.md).
 
+## Strategy Validation
+
+Dedicated validation runs evaluate frozen reviewed strategies on recent completed Alpaca data. Recent 30/90/180/365-day or custom periods, immutable dataset fingerprints, period-use/holdout access provenance, fixed-parameter rolling/expanding walk-forward windows, realistic cost/delay stress, nearby-parameter sensitivity, robust metrics, seeded moving-block bootstrap intervals, concentration/regimes, frozen criteria, progress/cancellation, saved comparisons, and JSON/CSV export are implemented. See [docs/validation.md](docs/validation.md) for setup, definitions, assumptions, examples, and limitations. Validation never proves future profitability.
+
 ## Autonomous Alpaca paper strategies
 
 Broker-paper sessions remain manual by default. An ACTIVE, reconciled session can separately enable autonomous paper execution with a strategy-bound typed confirmation. The server evaluates the reviewed immutable template on completed Alpaca bars, sizes entries to the approved maximum-order notional, exits the broker-reported long position, and uses deterministic per-bar client order IDs. Open, unknown, foreign, or unsupported short orders/positions block submission. Data/broker failures pause the session, retry reconciliation, then resume after recovery. Approval expiry, version mismatch, Stop, and Emergency Stop fail closed. This route is hard-coded to Alpaca's paper endpoint; real-money execution remains absent.
