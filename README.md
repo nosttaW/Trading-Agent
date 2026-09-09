@@ -64,7 +64,7 @@ Open <http://localhost:8000>. Health: <http://localhost:8000/api/health>. Readin
 
 1. Open **Settings → Alpaca connections**, save Market Data credentials, select the entitled feed, then test it.
 2. Optionally save server-side AI provider settings. Test connection. API keys return masked only.
-3. Open **Research Sessions → New research session**.
+3. Open **Research Sessions → New research session**. Choose a suggested prompt, use the guided prompt builder, or write complete Advanced instructions. Custom prompts cannot bypass reviewed-template, validation, security, or risk restrictions.
 4. Keep default 15-minute interval. Set candidate/time/token ceilings.
 5. Start. SQLite persistence plus the backend scheduler continue after browser closure.
 6. Pause/resume, or choose **Stop & backtest all**.
