@@ -26,6 +26,7 @@ def clean_database(monkeypatch):
     service.init_db()
     service.LOGIN_FAILURES.clear()
     monkeypatch.setattr(service, "alpaca_data_connection", lambda: True)
+    monkeypatch.setattr(service, "validate_alpaca_equity_symbol", lambda instrument: None)
     monkeypatch.setattr(service, "fetch_alpaca_bars", lambda *args: (service.demo_bars(args[1]), "iex"))
     login = client.post("/api/auth/login", json={"password": "correct horse battery staple"})
     assert login.status_code == 200
@@ -50,6 +51,7 @@ def session_config(**changes):
 def create_completed_session(monkeypatch=None):
     if monkeypatch:
         monkeypatch.setattr(service, "alpaca_data_connection", lambda: True)
+        monkeypatch.setattr(service, "validate_alpaca_equity_symbol", lambda instrument: None)
         monkeypatch.setattr(service, "fetch_alpaca_bars", lambda *args: (service.demo_bars(args[1]), "iex"))
     created = client.post("/api/research-sessions", json=session_config()).json()
     started = client.post(f"/api/research-sessions/{created['id']}/start").json()
@@ -212,6 +214,14 @@ def test_paper_risk_gate_and_emergency_stop(monkeypatch):
 def test_live_order_route_stays_blocked_with_paper_features(monkeypatch):
     paper_ready(monkeypatch)
     assert client.post("/api/orders", json={"mode": "live"}).status_code == 403
+
+
+def test_invalid_equity_symbol_is_rejected_before_session_creation(monkeypatch):
+    def reject(_): raise service.HTTPException(422, "No US-equity data found for BTC")
+    monkeypatch.setattr(service, "validate_alpaca_equity_symbol", reject)
+    result = client.post("/api/research-sessions", json=session_config(instruments=["BTC"]))
+    assert result.status_code == 422
+    assert "No US-equity data" in result.json()["detail"]
 
 
 def test_session_immediate_generation_and_frozen_config():

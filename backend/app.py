@@ -530,6 +530,36 @@ def alpaca_data_connection() -> sqlite3.Row:
     return row
 
 
+def validate_alpaca_equity_symbol(instrument: str) -> None:
+    row = alpaca_data_connection()
+    headers = {"APCA-API-KEY-ID": decrypt_secret(row["encrypted_key_id"]), "APCA-API-SECRET-KEY": decrypt_secret(row["encrypted_secret_key"])}
+    try:
+        with httpx.Client(timeout=15, follow_redirects=False) as client:
+            response = client.get(f"{row['base_url']}/v2/stocks/{instrument}/bars/latest", headers=headers, params={"feed": row["feed"]})
+        if 300 <= response.status_code < 400:
+            raise HTTPException(502, "Alpaca redirect rejected")
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError
+        if not payload.get("bar"):
+            raise HTTPException(422, f"No US-equity data found for {instrument} on the {row['feed']} feed. Check the stock symbol and entitlement.")
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            raise HTTPException(422, f"{instrument} is unavailable as a US-equity symbol on the configured Alpaca feed")
+        if exc.response.status_code in {401, 403}:
+            raise HTTPException(502, "Alpaca market-data authentication or entitlement failed")
+        if exc.response.status_code == 429:
+            raise HTTPException(503, "Alpaca market-data rate limit reached")
+        raise HTTPException(502, f"Alpaca market data returned HTTP {exc.response.status_code}")
+    except (httpx.TimeoutException, httpx.NetworkError):
+        raise HTTPException(504, "Alpaca symbol validation timed out")
+    except (ValueError, json.JSONDecodeError):
+        raise HTTPException(502, "Alpaca symbol validation returned malformed data")
+
+
 def fetch_alpaca_bars(instrument: str, timeframe: str, start: str, end: str) -> tuple[list[dict[str, Any]], str]:
     row = alpaca_data_connection()
     mapping = {"1m": "1Min", "5m": "5Min", "15m": "15Min", "1h": "1Hour", "1d": "1Day"}
@@ -545,12 +575,12 @@ def fetch_alpaca_bars(instrument: str, timeframe: str, start: str, end: str) -> 
                 if 300 <= response.status_code < 400: raise HTTPException(502, "Alpaca redirect rejected")
                 response.raise_for_status()
                 payload = response.json()
-                page = payload.get("bars")
+                page = payload.get("bars") or []
                 if not isinstance(page, list): raise ValueError
                 bars.extend({"timestamp": item["t"], "open": str(item["o"]), "high": str(item["h"]), "low": str(item["l"]), "close": str(item["c"]), "volume": item["v"]} for item in page)
                 next_token = payload.get("next_page_token")
                 if not next_token: break
-        if len(bars) < 2: raise HTTPException(422, "Alpaca returned insufficient historical bars for this selection")
+        if len(bars) < 2: raise HTTPException(422, f"No usable historical US-equity bars for {instrument} from {start} through {end} at {timeframe} on the {row['feed']} feed")
         previous = None
         for bar in bars:
             stamp = datetime.fromisoformat(bar["timestamp"].replace("Z", "+00:00"))
@@ -1261,6 +1291,7 @@ def list_sessions():
 @app.post("/api/research-sessions")
 def create_session(config: SessionConfig):
     alpaca_data_connection()
+    validate_alpaca_equity_symbol(config.instruments[0])
     if config.provider_id:
         with connect() as connection:
             if not connection.execute("SELECT id FROM providers WHERE id=?", (config.provider_id,)).fetchone():
