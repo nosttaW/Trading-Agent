@@ -126,6 +126,30 @@ def test_unsafe_custom_headers_rejected():
     assert result.status_code == 422
 
 
+def test_alpaca_credentials_are_mode_separated_encrypted_and_masked():
+    data = client.post("/api/alpaca-connections", json={"mode": "data", "label": "Data", "key_id": "DATAKEY1234", "secret_key": "DATASECRET1234", "feed": "iex"})
+    paper = client.post("/api/alpaca-connections", json={"mode": "paper", "label": "Paper", "key_id": "PAPERKEY1234", "secret_key": "PAPERSECRET1234", "feed": None})
+    assert data.status_code == paper.status_code == 200
+    assert "DATAKEY1234" not in data.text and "DATASECRET1234" not in data.text
+    assert data.json()["base_url"] == "https://data.alpaca.markets"
+    assert paper.json()["base_url"] == "https://paper-api.alpaca.markets"
+    with service.connect() as connection:
+        rows = connection.execute("SELECT * FROM alpaca_connections ORDER BY mode").fetchall()
+    assert len(rows) == 2
+    assert all("SECRET" not in row["encrypted_secret_key"] for row in rows)
+    assert service.decrypt_secret(rows[0]["encrypted_key_id"]) == "DATAKEY1234"
+
+
+def test_live_alpaca_credentials_disabled():
+    result = client.post("/api/alpaca-connections", json={"mode": "live", "label": "Live", "key_id": "LIVEKEY1234", "secret_key": "LIVESECRET1234"})
+    assert result.status_code == 403
+
+
+def test_alpaca_feed_validation():
+    assert client.post("/api/alpaca-connections", json={"mode": "data", "label": "Data", "key_id": "DATAKEY1234", "secret_key": "DATASECRET1234"}).status_code == 422
+    assert client.post("/api/alpaca-connections", json={"mode": "paper", "label": "Paper", "key_id": "PAPERKEY1234", "secret_key": "PAPERSECRET1234", "feed": "sip"}).status_code == 422
+
+
 def test_session_immediate_generation_and_frozen_config():
     created = client.post("/api/research-sessions", json=session_config()).json()
     original_hash = created["config_hash"]

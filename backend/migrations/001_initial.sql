@@ -20,6 +20,20 @@ CREATE TABLE IF NOT EXISTS providers (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS alpaca_connections (
+  mode TEXT PRIMARY KEY CHECK(mode IN ('data','paper','live')),
+  label TEXT NOT NULL,
+  encrypted_key_id TEXT NOT NULL,
+  encrypted_secret_key TEXT NOT NULL,
+  feed TEXT,
+  base_url TEXT NOT NULL,
+  last_test_status TEXT,
+  last_test_at TEXT,
+  account_id_masked TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS research_sessions (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,

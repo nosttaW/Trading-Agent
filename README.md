@@ -83,6 +83,16 @@ AI output is schema-validated. It may select one of three reviewed templates and
 
 Backtesting is a custom deterministic engine rather than a third-party library. Reason: required shared reviewed-template semantics, exact next-event timing, narrow initial scope, zero extra engine. Limit: not a general-purpose institutional simulator. Details: [`docs/strategy-interface.md`](docs/strategy-interface.md).
 
+## Alpaca credentials
+
+Open **Settings → Alpaca connections**. Credentials can be added separately for:
+
+- Market data: `https://data.alpaca.markets`, with explicit IEX/SIP/delayed-SIP feed selection.
+- Broker paper: `https://paper-api.alpaca.markets` only.
+- Live: `https://api.alpaca.markets`; storage remains disabled unless the server live flag is enabled. Orders remain absent regardless.
+
+Key IDs and secret keys are encrypted server-side with `APP_ENCRYPTION_KEY`; browser receives masked placeholders only. Connection tests call latest AAPL data or account status. Errors redact credentials. No mode fallback. Obtain keys from <https://app.alpaca.markets/>; select Paper Trading before creating paper keys.
+
 ## Provider behavior
 
 Supported explicit profiles:

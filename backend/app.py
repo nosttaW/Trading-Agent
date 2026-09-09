@@ -183,6 +183,23 @@ class ProviderInput(BaseModel):
         return value
 
 
+class AlpacaConnectionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    mode: Literal["data", "paper", "live"]
+    label: str = Field(default="Alpaca", min_length=2, max_length=80)
+    key_id: str = Field(min_length=8, max_length=200)
+    secret_key: str = Field(min_length=8, max_length=300)
+    feed: Literal["iex", "sip", "delayed_sip"] | None = None
+
+    @model_validator(mode="after")
+    def valid_feed(self):
+        if self.mode == "data" and self.feed is None:
+            raise ValueError("market-data credentials require a feed")
+        if self.mode != "data" and self.feed is not None:
+            raise ValueError("feed applies only to market-data credentials")
+        return self
+
+
 class SessionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str = Field(default="Momentum research", min_length=3, max_length=120)
@@ -377,6 +394,16 @@ def validate_endpoint(raw_url: str) -> str:
     return raw_url.rstrip("/")
 
 
+def mask_identifier(value: str | None) -> str | None:
+    if not value:
+        return None
+    return f"{value[:3]}••••{value[-4:]}" if len(value) > 7 else "••••"
+
+
+def alpaca_public(row: sqlite3.Row) -> dict[str, Any]:
+    return {"mode": row["mode"], "label": row["label"], "key_id_masked": "••••••••", "secret_key_masked": "••••••••", "feed": row["feed"], "base_url": row["base_url"], "last_test_status": row["last_test_status"], "last_test_at": row["last_test_at"], "account_id_masked": row["account_id_masked"], "created_at": row["created_at"], "updated_at": row["updated_at"]}
+
+
 def provider_public(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
     item.pop("encrypted_api_key", None)
@@ -431,6 +458,41 @@ async def call_provider(row: sqlite3.Row, purpose: str = "test") -> dict[str, An
         return {"ok": True, "usage": usage, "response": data}
     except (httpx.HTTPStatusError, httpx.TimeoutException, httpx.NetworkError, ValueError, json.JSONDecodeError) as exc:
         raise provider_error(exc)
+
+
+def test_alpaca(row: sqlite3.Row) -> dict[str, Any]:
+    key_id = decrypt_secret(row["encrypted_key_id"])
+    secret_key = decrypt_secret(row["encrypted_secret_key"])
+    headers = {"APCA-API-KEY-ID": key_id, "APCA-API-SECRET-KEY": secret_key}
+    if row["mode"] == "data":
+        url = f"{row['base_url']}/v2/stocks/AAPL/bars/latest?feed={row['feed']}"
+    else:
+        url = f"{row['base_url']}/v2/account"
+    try:
+        with httpx.Client(timeout=15, follow_redirects=False) as client:
+            response = client.get(url, headers=headers)
+        if 300 <= response.status_code < 400:
+            raise HTTPException(502, "Alpaca redirect rejected")
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError
+        if row["mode"] == "data":
+            return {"status": "CONNECTED", "message": f"Market-data credentials accepted for {row['feed']} feed.", "account_id_masked": None}
+        account_id = payload.get("id") or payload.get("account_number")
+        if not account_id:
+            raise ValueError
+        return {"status": "CONNECTED", "message": f"{row['mode'].title()} account credentials accepted.", "account_id_masked": mask_identifier(str(account_id)), "account_status": payload.get("status")}
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in {401, 403}:
+            raise HTTPException(502, "Alpaca authentication or entitlement failed. Check this mode's credentials and feed.")
+        if exc.response.status_code == 429:
+            raise HTTPException(502, "Alpaca rate limit reached. Retry later.")
+        raise HTTPException(502, f"Alpaca returned HTTP {exc.response.status_code}.")
+    except (httpx.TimeoutException, httpx.NetworkError):
+        raise HTTPException(504, "Alpaca timed out or could not be reached")
+    except (ValueError, json.JSONDecodeError):
+        raise HTTPException(502, "Alpaca returned malformed JSON")
 
 
 def provider_generate(row: sqlite3.Row, instructions: str, families: list[str]) -> tuple[dict[str, Any], int | None]:
@@ -887,6 +949,61 @@ async def test_provider(provider_id: str):
     result = await call_provider(row)
     audit("provider.tested", "provider", provider_id, {"ok": True})
     return {"ok": True, "message": "Connection succeeded", "usage_reported": result["usage"] is not None}
+
+
+@app.get("/api/alpaca-connections")
+def list_alpaca_connections():
+    with connect() as connection:
+        rows = connection.execute("SELECT * FROM alpaca_connections ORDER BY CASE mode WHEN 'data' THEN 1 WHEN 'paper' THEN 2 ELSE 3 END").fetchall()
+    return [alpaca_public(row) for row in rows]
+
+
+@app.post("/api/alpaca-connections")
+def save_alpaca_connection(value: AlpacaConnectionInput):
+    if value.mode == "live" and os.getenv("ENABLE_LIVE_TRADING", "false").lower() != "true":
+        raise HTTPException(403, "Live credential storage disabled by server setting")
+    base_url = {"data": "https://data.alpaca.markets", "paper": "https://paper-api.alpaca.markets", "live": "https://api.alpaca.markets"}[value.mode]
+    current = iso()
+    encrypted_key = encrypt_secret(value.key_id)
+    encrypted_secret = encrypt_secret(value.secret_key)
+    with connect() as connection:
+        existing = connection.execute("SELECT created_at FROM alpaca_connections WHERE mode=?", (value.mode,)).fetchone()
+        connection.execute(
+            "INSERT INTO alpaca_connections VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(mode) DO UPDATE SET label=excluded.label,encrypted_key_id=excluded.encrypted_key_id,encrypted_secret_key=excluded.encrypted_secret_key,feed=excluded.feed,base_url=excluded.base_url,last_test_status=NULL,last_test_at=NULL,account_id_masked=NULL,updated_at=excluded.updated_at",
+            (value.mode, value.label, encrypted_key, encrypted_secret, value.feed, base_url, None, None, None, existing["created_at"] if existing else current, current),
+        )
+        row = connection.execute("SELECT * FROM alpaca_connections WHERE mode=?", (value.mode,)).fetchone()
+    audit("alpaca.credentials_saved", "alpaca_connection", value.mode, {"mode": value.mode, "feed": value.feed, "base_url": base_url})
+    return alpaca_public(row)
+
+
+@app.delete("/api/alpaca-connections/{mode}")
+def delete_alpaca_connection(mode: Literal["data", "paper", "live"]):
+    with connect() as connection:
+        deleted = connection.execute("DELETE FROM alpaca_connections WHERE mode=?", (mode,)).rowcount
+    if not deleted:
+        raise HTTPException(404, "Alpaca connection not found")
+    audit("alpaca.credentials_deleted", "alpaca_connection", mode, {"mode": mode})
+    return {"deleted": True}
+
+
+@app.post("/api/alpaca-connections/{mode}/test")
+def test_alpaca_connection(mode: Literal["data", "paper", "live"]):
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM alpaca_connections WHERE mode=?", (mode,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Alpaca connection not found")
+    try:
+        result = test_alpaca(row)
+    except HTTPException as exc:
+        with connect() as connection:
+            connection.execute("UPDATE alpaca_connections SET last_test_status='FAILED',last_test_at=? WHERE mode=?", (iso(), mode))
+        audit("alpaca.connection_failed", "alpaca_connection", mode, {"mode": mode, "error": str(exc.detail)})
+        raise
+    with connect() as connection:
+        connection.execute("UPDATE alpaca_connections SET last_test_status=?,last_test_at=?,account_id_masked=? WHERE mode=?", (result["status"], iso(), result["account_id_masked"], mode))
+    audit("alpaca.connection_tested", "alpaca_connection", mode, {"mode": mode, "status": result["status"], "account_id_masked": result["account_id_masked"]})
+    return result
 
 
 @app.get("/api/research-sessions")
