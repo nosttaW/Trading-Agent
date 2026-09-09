@@ -90,7 +90,7 @@ Implemented: encrypted key/headers, connection test, non-streaming generation, l
 
 Not assumed: model listing, streaming, tools, temperature support, JSON Schema support, Responses support. Remove `temperature` when an endpoint rejects it; the app never silently changes capabilities. Reliable dollar-metering is not assumed; hard candidate/time/token ceilings remain mandatory.
 
-Endpoint protection resolves DNS before requests; blocks non-HTTPS remote endpoints, redirects, metadata/link-local/private/loopback/reserved/multicast addresses, embedded credentials, unsafe headers. Administrator exceptions use `AI_LOCAL_ENDPOINT_ALLOWLIST=host:port`. This is defense in depth; production egress policy and a resolving proxy are still required against TOCTOU DNS rebinding.
+Endpoint protection resolves DNS before requests; blocks non-HTTPS remote endpoints, redirects, metadata/link-local/private/loopback/reserved/multicast addresses, embedded credentials, unsafe headers. Administrator exceptions use `AI_LOCAL_ENDPOINT_ALLOWLIST=host:port`. Arcane currently allows only `192.168.2.77:8000`; enter base URL `http://192.168.2.77:8000/v1`. This is defense in depth; production egress policy and a resolving proxy are still required against TOCTOU DNS rebinding.
 
 ## Testing
 
