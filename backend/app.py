@@ -94,6 +94,9 @@ def init_db() -> None:
             if columns and required not in columns:
                 connection.execute(f"ALTER TABLE {table} RENAME TO legacy_{table}")
         connection.executescript(MIGRATION.read_text())
+        candidate_columns = {row[1] for row in connection.execute("PRAGMA table_info(candidates)").fetchall()}
+        if "archived_at" not in candidate_columns:
+            connection.execute("ALTER TABLE candidates ADD COLUMN archived_at TEXT")
 
 
 def audit(kind: str, resource_type: str, resource_id: str, payload: dict[str, Any], actor: str = "local-user") -> None:
@@ -773,7 +776,7 @@ def create_candidate(session_id: str) -> dict[str, Any]:
                 candidate_id = str(uuid.uuid4())
                 warnings = ["Provider generation failed. Attempt retained; no fallback provider or model used."]
                 connection.execute(
-                    "INSERT INTO candidates VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO candidates(id,session_id,ordinal,status,family,name,hypothesis,parameters,source,source_hash,normalized_hash,dependency_manifest,provider_id,model_id,prompt_version,token_usage,estimated_cost,warnings,error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (candidate_id, session_id, ordinal, "INVALID", None, f"Failed provider attempt · {ordinal}", "No validated hypothesis returned.", "{}", "", digest(b""), digest({"invalid": candidate_id}), "[]", provider["id"], provider["model_id"], PROMPT_VERSION, tokens, None, canonical(warnings), last_error, iso()),
                 )
                 next_run = utcnow() + timedelta(minutes=config["generation_interval_minutes"])
@@ -791,7 +794,7 @@ def create_candidate(session_id: str) -> dict[str, Any]:
         candidate_id = str(uuid.uuid4())
         warnings = ["Reviewed template mode: arbitrary generated Python execution is disabled.", "Model-generated hypothesis; external research and citations were not verified."]
         connection.execute(
-            "INSERT INTO candidates VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO candidates(id,session_id,ordinal,status,family,name,hypothesis,parameters,source,source_hash,normalized_hash,dependency_manifest,provider_id,model_id,prompt_version,token_usage,estimated_cost,warnings,error,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (candidate_id, session_id, ordinal, status, family, name or f"{template['name']} · {ordinal}", hypothesis or template["hypothesis"], canonical(variant), source, source_hash, normalized_hash, canonical(["strategy-lab-stdlib==2.0"]), provider["id"] if provider else None, provider["model_id"] if provider else "reviewed-template-demo", PROMPT_VERSION, tokens, None, canonical(warnings), None, iso()),
         )
         interval = timedelta(minutes=config["generation_interval_minutes"])
@@ -1272,15 +1275,33 @@ def run_due_for_local_testing():
 
 @app.get("/api/backtests")
 def list_backtests(session_id: str | None = None):
-    query = "SELECT b.*,c.name,c.family,c.source,c.source_hash,c.parameters,c.hypothesis,c.dependency_manifest FROM backtests b JOIN candidates c ON c.id=b.candidate_id"
+    query = "SELECT b.*,c.name,c.family,c.source,c.source_hash,c.parameters,c.hypothesis,c.dependency_manifest FROM backtests b JOIN candidates c ON c.id=b.candidate_id WHERE c.archived_at IS NULL"
     params: tuple[Any, ...] = ()
     if session_id:
-        query += " WHERE b.session_id=?"
+        query += " AND b.session_id=?"
         params = (session_id,)
     query += " ORDER BY b.completed_at DESC"
     with connect() as connection:
         rows = connection.execute(query, params).fetchall()
     return [json_row(row, ("assumptions", "metrics", "equity_curve", "drawdown_curve", "trades", "warnings", "parameters", "dependency_manifest")) for row in rows]
+
+
+@app.delete("/api/strategies/{candidate_id}")
+def archive_strategy(candidate_id: str):
+    with connect() as connection:
+        candidate = connection.execute("SELECT id,name,archived_at FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+        if not candidate:
+            raise HTTPException(404, "Strategy not found")
+        if candidate["archived_at"]:
+            return {"archived": True, "candidate_id": candidate_id}
+        live = connection.execute("SELECT id FROM live_tests WHERE candidate_id=? AND state NOT IN ('STOPPED','EXPIRED')", (candidate_id,)).fetchone()
+        paper = connection.execute("SELECT id FROM paper_sessions WHERE candidate_id=? AND state NOT IN ('STOPPED','EXPIRED')", (candidate_id,)).fetchone()
+        if live or paper:
+            raise HTTPException(409, "Stop active live-data and broker-paper sessions before deleting this strategy")
+        archived_at = iso()
+        connection.execute("UPDATE candidates SET archived_at=? WHERE id=?", (archived_at, candidate_id))
+    audit("strategy.archived", "candidate", candidate_id, {"name": candidate["name"], "archived_at": archived_at})
+    return {"archived": True, "candidate_id": candidate_id, "history_preserved": True}
 
 
 @app.get("/api/backtests/{backtest_id}")

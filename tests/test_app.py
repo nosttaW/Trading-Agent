@@ -247,6 +247,26 @@ def test_duplicate_attempt_is_retained():
     assert session["candidates"][-1]["status"] == "DUPLICATE"
 
 
+def test_strategy_delete_archives_but_preserves_history():
+    completed = create_completed_session()
+    backtest = completed["backtests"][0]
+    archived = client.delete(f"/api/strategies/{backtest['candidate_id']}")
+    assert archived.status_code == 200
+    assert archived.json()["history_preserved"] is True
+    assert client.get("/api/backtests").json() == []
+    assert client.get(f"/api/backtests/{backtest['id']}").status_code == 200
+    with service.connect() as connection:
+        assert connection.execute("SELECT archived_at FROM candidates WHERE id=?", (backtest["candidate_id"],)).fetchone()[0]
+
+
+def test_strategy_delete_blocked_by_active_forward_test():
+    completed = create_completed_session(); backtest = completed["backtests"][0]
+    created = client.post("/api/live-tests", json={"backtest_id": backtest["id"], "entitlement": "delayed", "delay_minutes": 15, "confirmation": "Start Live Data Test"})
+    assert created.status_code == 200
+    result = client.delete(f"/api/strategies/{backtest['candidate_id']}")
+    assert result.status_code == 409
+
+
 def test_backtest_fill_is_after_signal_bar():
     completed = create_completed_session()
     backtest = completed["backtests"][0]

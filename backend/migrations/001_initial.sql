@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS candidates (
   warnings TEXT NOT NULL,
   error TEXT,
   created_at TEXT NOT NULL,
+  archived_at TEXT,
   UNIQUE(session_id, ordinal)
 );
 
