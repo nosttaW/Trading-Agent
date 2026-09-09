@@ -2,8 +2,6 @@ name: Test and package
 
 on:
   push:
-    branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
@@ -44,13 +42,21 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - id: image-tags
+        if: github.event_name != 'pull_request'
+        shell: bash
+        run: |
+          echo 'tags<<EOF' >> "$GITHUB_OUTPUT"
+          echo 'ghcr.io/nosttaw/trading-agent:${{ github.sha }}' >> "$GITHUB_OUTPUT"
+          if [[ '${{ github.ref }}' == 'refs/heads/main' ]]; then
+            echo 'ghcr.io/nosttaw/trading-agent:latest' >> "$GITHUB_OUTPUT"
+          fi
+          echo 'EOF' >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
-          tags: |
-            ghcr.io/nosttaw/trading-agent:${{ github.sha }}
-            ghcr.io/nosttaw/trading-agent:latest
+          tags: ${{ steps.image-tags.outputs.tags || format('ghcr.io/nosttaw/trading-agent:pr-{0}', github.event.pull_request.number) }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           labels: |
