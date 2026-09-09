@@ -1477,7 +1477,7 @@ def process_validation_run(run_id: str) -> None:
                 if connection.execute("SELECT cancellation_requested FROM validation_runs WHERE id=?", (run_id,)).fetchone()[0]:
                     connection.execute("UPDATE validation_runs SET state='CANCELED',error='Canceled by user',completed_at=? WHERE id=?", (iso(), run_id)); return
             per_day = {"1m": 390, "5m": 78, "15m": 26, "1h": 7, "1d": 1}[spec["timeframe"]]
-            warmup_days = max(5, math.ceil(max(params.values()) / per_day) * 2)
+            warmup_days = max(5, math.ceil(max(params.values()) / per_day) * 2, spec["training_days"] + 14 if spec["walk_forward_mode"] != "fixed" else 0)
             fetch_start = (datetime.fromisoformat(start).date() - timedelta(days=warmup_days)).isoformat()
             bars, feed, dataset_id, cache_hit = cached_or_fetch(symbol, spec["timeframe"], fetch_start, end)
             regular = regular_session_bars(bars, spec["timeframe"]); expected = expected_bar_count(start, end, spec["timeframe"]); last_bar = regular[-1]["timestamp"]
@@ -1503,7 +1503,7 @@ def process_validation_run(run_id: str) -> None:
             delays = [{"delay_bars": delay, "metrics": evaluate_strategy(candidate, config, regular, score_start=score_start, execution_delay_bars=delay, seed=spec["seed"], bootstrap_samples=0)["metrics"]} for delay in sorted({1, spec["execution_delay_bars"], min(5, spec["execution_delay_bars"] + 1)})]
             windows = []
             if spec["walk_forward_mode"] != "fixed":
-                per_day = {"1m": 390, "5m": 78, "15m": 26, "1h": 7, "1d": 1}[spec["timeframe"]]; train = spec["training_days"] * per_day; test = spec["testing_days"] * per_day; step = spec["step_days"] * per_day; cursor = train
+                train = spec["training_days"] * per_day; test = spec["testing_days"] * per_day; step = spec["step_days"] * per_day; cursor = max(train, score_start)
                 while cursor + spec["embargo_bars"] + test <= len(regular) and len(windows) < 50:
                     test_start = cursor + spec["embargo_bars"]; window_end = test_start + test
                     result = evaluate_strategy(candidate, config, regular, score_start=test_start, score_end=window_end, execution_delay_bars=spec["execution_delay_bars"], seed=spec["seed"], bootstrap_samples=0)
@@ -1514,7 +1514,15 @@ def process_validation_run(run_id: str) -> None:
             with connect() as connection: connection.execute("UPDATE validation_runs SET progress=? WHERE id=?", (20 + round((index + 1) / len(spec["symbols"]) * 70), run_id))
         original_metrics = json.loads(row["original_metrics"] or "{}"); first = symbol_results[0]["base"]["metrics"]
         comparison = {key: {"original": original_metrics.get(key), "recent": first.get(key), "change": round(first[key] - original_metrics[key], 2) if isinstance(first.get(key), (int, float)) and isinstance(original_metrics.get(key), (int, float)) else None} for key in ("net_return_percent", "maximum_drawdown_percent", "sharpe", "trade_count", "exposure_percent", "turnover_percent")}
-        result = {"period": {"start": start, "end": end}, "symbols": symbol_results, "original_comparison": comparison, "combined_oos_equity_curve": [point for symbol in symbol_results for window in symbol["walk_forward"] for point in window["equity_curve"]], "metric_definitions": {"returns": "Compounded scored-bar portfolio returns after modeled costs.", "cagr": "Annualized geometric return only when scored span is at least 30 calendar days.", "volatility": "Sample standard deviation of scored-bar returns, annualized by timeframe.", "sharpe": "Mean scored-bar excess return divided by sample deviation; zero risk-free rate.", "sortino": "Mean scored-bar excess return divided by RMS nonpositive returns; zero risk-free rate.", "cash": "Zero return, explicitly excluding interest.", "undefined": "Unavailable where observations/denominators are insufficient; never replaced by zero."}}
+        combined = []
+        if len(symbol_results) == 1:
+            capital = float(json.loads(row["original_assumptions"])["starting_capital"])
+            for window in symbol_results[0]["walk_forward"]:
+                first_value = window["equity_curve"][0]["value"] if window["equity_curve"] else capital
+                for point in window["equity_curve"]:
+                    combined.append({"at": point["at"], "value": round(capital * point["value"] / first_value, 2)})
+                if combined: capital = combined[-1]["value"]
+        result = {"period": {"start": start, "end": end}, "symbols": symbol_results, "original_comparison": comparison, "combined_oos_equity_curve": combined, "metric_definitions": {"returns": "Compounded scored-bar portfolio returns after modeled costs.", "cagr": "Annualized geometric return only when scored span is at least 30 calendar days.", "volatility": "Sample standard deviation of scored-bar returns, annualized by timeframe.", "sharpe": "Mean scored-bar excess return divided by sample deviation; zero risk-free rate.", "sortino": "Mean scored-bar excess return divided by RMS nonpositive returns; zero risk-free rate.", "cash": "Zero return, explicitly excluding interest.", "undefined": "Unavailable where observations/denominators are insufficient; never replaced by zero."}}
         with connect() as connection:
             connection.execute("UPDATE validation_runs SET state='COMPLETED',progress=100,dataset_refs=?,result=?,warnings=?,completed_at=? WHERE id=?", (canonical(dataset_refs), canonical(result), canonical(warnings), iso(), run_id))
             for ref in dataset_refs: connection.execute("INSERT INTO strategy_period_uses VALUES(?,?,?,?,?,?,?)", (str(uuid.uuid4()), row["candidate_id"], run_id, "final_holdout", start, end, iso()))

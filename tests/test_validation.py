@@ -109,6 +109,19 @@ def test_validation_api_create_process_reopen_export_and_cancel(monkeypatch):
     assert canceled.status_code == 200 and canceled.json()["state"] == "CANCELED"
 
 
+def test_walk_forward_windows_begin_in_requested_holdout(monkeypatch):
+    completed = base.create_completed_session(monkeypatch); backtest = completed["backtests"][0]
+    bars = service.demo_bars("1d")
+    monkeypatch.setattr(service, "fetch_alpaca_bars", lambda *_: (bars, "iex"))
+    start, end = bars[-180]["timestamp"][:10], bars[-1]["timestamp"][:10]
+    created = client.post("/api/validations", json={"backtest_id": backtest["id"], "symbols": ["SPY"], "timeframe": "1d", "period_preset": "custom", "start_date": start, "end_date": end, "walk_forward_mode": "rolling", "training_days": 30, "testing_days": 10, "step_days": 10, "minimum_trades": 0}).json()
+    service.process_validation_jobs(); result = client.get(f"/api/validations/{created['id']}").json()["result"]
+    windows = result["symbols"][0]["walk_forward"]
+    assert windows and all(window["test_start"][:10] >= start for window in windows)
+    combined = result["combined_oos_equity_curve"]
+    assert combined and all(combined[i]["at"] < combined[i+1]["at"] for i in range(len(combined)-1))
+
+
 def test_same_frozen_inputs_are_numerically_identical():
     bars = service.demo_bars("15m")
     kwargs = {"score_start": 100, "score_end": 500, "seed": 123, "execution_delay_bars": 2}
