@@ -135,6 +135,8 @@ CREATE TABLE IF NOT EXISTS backtests (
   error TEXT,
   started_at TEXT NOT NULL,
   completed_at TEXT,
+  invalidated_at TEXT,
+  invalidation_reason TEXT,
   UNIQUE(candidate_id, dataset_hash, engine_hash)
 );
 

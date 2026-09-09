@@ -413,6 +413,25 @@ def test_pause_resume_and_no_missed_tick_burst():
     assert datetime.fromisoformat(resumed["next_run_at"]) > datetime.now(UTC)
 
 
+def test_zero_valid_candidates_fail_session(monkeypatch):
+    monkeypatch.setattr(service, "provider_generate", lambda *_: (_ for _ in ()).throw(service.HTTPException(504, "provider timeout")))
+    with service.connect() as connection:
+        connection.execute("INSERT INTO providers VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("provider", "Provider", "https://api.example.com/v1", "chat_completions", "model", service.encrypt_secret("secret"), service.encrypt_secret({}), 2, 1000, 0.2, 1, 0, None, None, service.iso(), service.iso()))
+    created = client.post("/api/research-sessions", json=session_config(provider_id="provider", maximum_candidates=1)).json()
+    client.post(f"/api/research-sessions/{created['id']}/start")
+    result = client.post(f"/api/research-sessions/{created['id']}/control", json={"action": "stop"}).json()
+    assert result["state"] == "FAILED" and result["backtests"] == []
+
+
+def test_intraday_backtest_uses_regular_hours_and_flattens_daily():
+    candidate = {"family": "moving_average", "parameters": '{"fast":10,"slow":40}'}
+    bars = service.demo_bars("15m")[:200]
+    result = service.backtest_candidate(candidate, session_config(timeframe="15m") | {"minimum_trade_count": 0, "starting_capital": "10000", "allocation_fraction": "0.25", "fee_bps": "1", "spread_bps": "2", "slippage_bps": "3"}, bars)
+    eastern = service.ZoneInfo("America/New_York")
+    assert all(9 <= datetime.fromisoformat(trade["entry_time"]).astimezone(eastern).hour < 16 for trade in result["trades"])
+    assert all(not trade["exit_time"] or datetime.fromisoformat(trade["entry_time"]).astimezone(eastern).date() == datetime.fromisoformat(trade["exit_time"]).astimezone(eastern).date() for trade in result["trades"])
+
+
 def test_stop_backtests_every_valid_candidate():
     completed = create_completed_session()
     valid = [item for item in completed["candidates"] if item["status"] == "VALID"]
