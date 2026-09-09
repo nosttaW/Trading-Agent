@@ -1,55 +1,117 @@
-# Guardrail Trading MVP
+# Strategy Lab
 
-**Not investment advice. Backtests, AI research, and paper trading do not predict future returns. Execution can differ materially. Loss of all allocated capital remains possible. No profit is promised.**
+Responsive strategy-research software: persistent 15-minute sessions, configurable OpenAI-compatible providers, reviewed Python strategy templates, deterministic chronological batch backtests, leaderboard/comparison, immutable live-data-test setup, audit history, fail-closed trading screens.
 
-Small local demo. One FastAPI backend, React UI, SQLite. It deliberately does **not** transmit a broker order, fabricate fills, use an AI key, fetch market data, or enable live trading.
+> **No profit promise. Not investment advice.** Backtests and simulations do not predict future returns. Execution can differ materially. Risk thresholds are not guaranteed loss caps.
 
-## Run
+## Safety status
 
-```sh
+| Mode | Status |
+|---|---|
+| Demo | Working. Deterministic sample bars; explicitly labeled. |
+| Historical backtest | Working for reviewed long-only SPY daily templates. |
+| Live Data Test | Persistent immutable session/setup works; awaits configured current Alpaca data; never invents ticks/fills. |
+| Broker Paper | Disabled pending authenticated adapter and reconciliation. |
+| Live Trading | Disabled. No broker-order submission implementation exists. |
+| Arbitrary Python | Disabled. Source view/download works; trusted host executes reviewed templates only. |
+
+`ENABLE_LIVE_TRADING=true` **does not enable orders**. `/api/orders` always returns `403`. Research, backtesting, and live-data-test creation cannot place broker orders.
+
+## Local startup
+
+```bash
+cp .env.example .env
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Paste output into APP_ENCRYPTION_KEY in .env
 python -m pip install -r backend/requirements.txt pytest
 python -m uvicorn --app-dir backend app:app --reload
-cd frontend && npm install && npm run dev
-python -m pytest -q
 ```
 
-Or `docker compose up`. Open `http://localhost:5173`.
+Separate terminal:
 
-## Production image
-
-```sh
-docker build -t guardrail-trading:latest .
-docker run --rm -p 8000:8000 -v guardrail-trading-data:/data guardrail-trading:latest
+```bash
+cd frontend
+npm ci
+npm run dev
 ```
 
-Open `http://localhost:8000`. The image serves the compiled UI and API. It persists SQLite only in `/data`, runs unprivileged/read-only, has no broker credentials, and pins `ENABLE_LIVE_TRADING=false` in `docker-compose.arcane.yml`.
+Open <http://localhost:5173>. Production build:
 
-GitHub Actions packages `ghcr.io/nosttaW/trading-agent` on `main` pushes. Arcane builds the same local image from `Dockerfile`; project manifest: `arcane-project.json`.
+```bash
+cd frontend && npm run build
+rm -rf backend/static && cp -R dist backend/static
+python -m uvicorn --app-dir backend app:app --host 0.0.0.0 --port 8000
+```
 
-## Implemented boundary
+Docker:
 
-`declarative candidate → strict schema → deterministic demo chronological backtest → typed paper approval → immutable strategy/engine hash check → independent risk gate → broker adapter boundary → audit log`
+```bash
+cp .env.example .env
+# Set APP_ENCRYPTION_KEY
+# Compose reads .env
+docker compose up --build
+```
 
-- Strategy JSON rejects unknown fields, executable code, non-finite/negative monetary values, unsafe allocations, unsupported symbols/timeframes, ambiguous crossover rules.
-- Monetary calculations use `Decimal`; timestamps use UTC.
-- Demo bars are explicitly labeled deterministic local-development data. No fabricated data is ever represented as real market data.
-- Backtests model a conservative simplified 5 bps cost/slippage fill. `ponytail:` ceiling: daily close-only, one long-only MA crossover. Upgrade only after licensed historical data, corporate-action handling, calendars, walk-forward/holdout controls, paper-forward reconciliation.
-- Paper approval requires an exact typed authorization. Strategy and engine hashes bind it. Live approvals/orders are server-blocked even if `ENABLE_LIVE_TRADING=true`; client requests cannot enable live operation.
-- AI, web research, remote content ingestion, autonomous strategy creation, order streaming, market streaming, account storage, reconciliation, broker credentials, paper/live submission are intentionally absent. No incomplete integration receives an order.
+Open <http://localhost:5173>. Health: <http://localhost:8000/api/health>. Readiness: <http://localhost:8000/api/readiness>.
 
-## Alpaca verification record
+## Beginner workflow
 
-Retrieved **2026-09-08 UTC**. Official docs were fetched with a standard browser user agent. Paths/endpoints, entitlements, rate limits, SDK status, order lifecycle/state mapping, fractional and extended-hours rules must be re-verified against these sources immediately before implementing authenticated calls:
+1. Use Demo immediately, or open **Settings → Connect endpoint**.
+2. Save server-side provider settings. Test connection. API keys return masked only.
+3. Open **Research Sessions → New research session**.
+4. Keep default 15-minute interval. Set candidate/time/token ceilings.
+5. Start. SQLite persistence plus the backend scheduler continue after browser closure.
+6. Pause/resume, or choose **Stop & backtest all**.
+7. Review all attempts—including duplicates/invalid output—and backtest outcomes.
+8. Search/sort/pin up to four compatible results. Inspect rules, code, trades, warnings, lineage.
+9. Select **Test on Live Data**. Confirm a fresh immutable simulated account.
+10. Current market-data ingestion remains waiting until configured. It cannot fall back to broker paper/live.
 
-- Trading API: <https://docs.alpaca.markets/us/docs/trading-api>
-- Authentication: <https://docs.alpaca.markets/us/reference/authentication-2>
-- API reference: <https://docs.alpaca.markets/docs/api-references/trading-api/>
-- Market Data API: <https://docs.alpaca.markets/docs/api-references/market-data-api/>
-- SDK documentation: <https://alpaca.markets/docs/api-documentation/client-sdk/>
-- Rate limits: <https://docs.alpaca.markets/docs/broker-api-rate-limits>
+## Architecture
 
-The adapter pins distinct declared paper/live URLs: `https://paper-api.alpaca.markets` and `https://api.alpaca.markets`. It does not infer mode, fall back, send credentials, or substitute fills. Its required interface enumerates all requested broker operations but fails closed until the above review creates a tested authenticated implementation.
+One FastAPI app, one React/Vite UI, one SQLite deployment database. Minimal implementation; no microservices. The backend scheduler scans persistent due sessions every five seconds. Each generation updates `next_run_at`; downtime causes one recovery attempt, never a burst of missed ticks. `in_flight` prevents overlap in this single-instance deployment. Production scale-out requires DB-backed compare-and-swap leases or PostgreSQL row locks.
 
-## Production gate
+Schema: `backend/migrations/001_initial.sql`. File plan: `PLAN.md`.
 
-Do not use this demo to trade. Before any paper broker submission: implement tested authenticated official Alpaca calls; account/environment identity verification; asset tradability; order lifecycle; reconciliation/recovery; audit-event immutability; approved data feeds; calendar/halts; all listed validation stages; paper-forward requirements; secrets management; authenticated multi-user UI; PostgreSQL migration; monitoring/alerts; independent deployment of risk controls. Before live: every paper-forward requirement, fresh typed live approval, all hash checks, reconciliation, safety halt, persistent red `LIVE` UI, max 24-hour initial authorization.
+AI output is schema-validated. It may select one of three reviewed templates and a bounded variant. No returned source is executed. Invalid provider responses remain visible. Provider/model/profile never changes silently.
+
+Backtesting is a custom deterministic engine rather than a third-party library. Reason: required shared reviewed-template semantics, exact next-event timing, narrow initial scope, zero extra engine. Limit: not a general-purpose institutional simulator. Details: [`docs/strategy-interface.md`](docs/strategy-interface.md).
+
+## Provider behavior
+
+Supported explicit profiles:
+
+- Chat Completions: `POST {base_url}/chat/completions`
+- Responses: `POST {base_url}/responses`
+
+Implemented: encrypted key/headers, connection test, non-streaming generation, local JSON validation, usage capture when reported, timeout, bounded repair attempts, actionable redacted errors.
+
+Not assumed: model listing, streaming, tools, temperature support, JSON Schema support, Responses support. Remove `temperature` when an endpoint rejects it; the app never silently changes capabilities. Reliable dollar-metering is not assumed; hard candidate/time/token ceilings remain mandatory.
+
+Endpoint protection resolves DNS before requests; blocks non-HTTPS remote endpoints, redirects, metadata/link-local/private/loopback/reserved/multicast addresses, embedded credentials, unsafe headers. Administrator exceptions use `AI_LOCAL_ENDPOINT_ALLOWLIST=host:port`. This is defense in depth; production egress policy and a resolving proxy are still required against TOCTOU DNS rebinding.
+
+## Testing
+
+```bash
+pytest -q
+cd frontend && npm run build
+```
+
+Tests cover fail-closed orders, encrypted/masked secrets, SSRF blocks, local allowlist, unsafe headers, immediate generation, 15-minute schedule, pause/resume, no missed-tick burst, stop/finalize, duplicates, chronological fill timing, immutable forward snapshot, fresh account, delayed-data validation, cancellation retention, audit chaining.
+
+All broker tests are absence/fake-boundary tests. No real order is submitted.
+
+## Deployment
+
+One supported host: Docker Engine with Compose. See [`docs/operations.md`](docs/operations.md) for deployment, rollback, backup, restore test, updates, structured logs, limitations.
+
+## Documentation
+
+- [`docs/strategy-interface.md`](docs/strategy-interface.md) — Python API and execution semantics
+- [`docs/security.md`](docs/security.md) — threat model and disabled capabilities
+- [`docs/operations.md`](docs/operations.md) — deployment, backup, restore, update
+- [`docs/references.md`](docs/references.md) — official provider/Alpaca sources and retrieval record
+
+## Reference video disclosure
+
+The YouTube page HTML was reachable on 2026-09-09 UTC, but browser automation/video playback was unavailable. The 5:08 segment was **not watched or claimed as matched**. Implementation follows the supplied results specification: session summary, sortable leaderboard, equity curves, metrics, detail tabs, trades, warnings, and up-to-four comparison.
