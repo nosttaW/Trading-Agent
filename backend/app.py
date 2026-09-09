@@ -1180,7 +1180,9 @@ def process_live_tests() -> int:
             logs = append_live_log(logs, "info", f"Simulated {'entry' if pending else 'exit'} filled on next eligible bar.")
         market_value = sum(decimal_value(position["quantity"]) * decimal_value(latest["close"]) for position in positions)
         equity = cash + market_value
-        runtime = {"last_processed_at": latest["timestamp"], "pending_target": target, "warmup_complete": True, "events_processed": int(runtime.get("events_processed", 0)) + 1}
+        equity_curve = runtime.get("equity_curve") or [{"at": row["created_at"], "value": float(decimal_value(config["starting_virtual_cash"]))}]
+        equity_curve.append({"at": latest["timestamp"], "value": round(float(equity), 2)})
+        runtime = {"last_processed_at": latest["timestamp"], "pending_target": target, "warmup_complete": True, "events_processed": int(runtime.get("events_processed", 0)) + 1, "equity_curve": equity_curve[-2000:]}
         state = "PAUSED_ENTRIES" if row["paused_entries"] else "RUNNING"
         with connect() as connection:
             connection.execute("UPDATE live_tests SET state=?,virtual_cash=?,equity=?,positions=?,fills=?,last_event_at=?,runtime_state=?,logs=? WHERE id=?", (state, f"{cash:.2f}", f"{equity:.2f}", canonical(positions), canonical(fills[-500:]), latest["timestamp"], canonical(runtime), canonical(logs), row["id"]))
@@ -1521,7 +1523,7 @@ def create_live_test(value: LiveTestInput):
     warnings = ["Current Alpaca market data with app-simulated orders only. No broker order route exists.", "Historical warm-up rebuilds indicators without placing orders.", "Simulated fills cannot reproduce queue position or exact broker execution."]
     state = "WARMING_UP"
     with connect() as connection:
-        connection.execute("INSERT INTO live_tests(id,backtest_id,candidate_id,strategy_hash,source_snapshot,parameters_snapshot,dependency_snapshot,engine_version,state,mode,config,virtual_cash,equity,positions,pending_orders,fills,last_event_at,created_at,expires_at,paused_entries,warnings,runtime_state,logs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (live_id, backtest["id"], backtest["candidate_id"], backtest["source_hash"], backtest["source"], backtest["parameters"], backtest["dependency_manifest"], ENGINE_VERSION, state, "LIVE_DATA_SIMULATED", canonical(config), cash, cash, "[]", "[]", "[]", None, iso(), expires.isoformat(), 0, canonical(warnings), "{}", canonical([{"at": iso(), "level": "info", "message": "Live-data test created; warm-up queued on server."}])))
+        connection.execute("INSERT INTO live_tests(id,backtest_id,candidate_id,strategy_hash,source_snapshot,parameters_snapshot,dependency_snapshot,engine_version,state,mode,config,virtual_cash,equity,positions,pending_orders,fills,last_event_at,created_at,expires_at,paused_entries,warnings,runtime_state,logs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (live_id, backtest["id"], backtest["candidate_id"], backtest["source_hash"], backtest["source"], backtest["parameters"], backtest["dependency_manifest"], ENGINE_VERSION, state, "LIVE_DATA_SIMULATED", canonical(config), cash, cash, "[]", "[]", "[]", None, iso(), expires.isoformat(), 0, canonical(warnings), canonical({"equity_curve": [{"at": iso(), "value": float(decimal_value(value.starting_virtual_cash))}], "events_processed": 0, "warmup_complete": False}), canonical([{"at": iso(), "level": "info", "message": "Live-data test created; warm-up queued on server."}])))
     audit("live_test.created", "live_test", live_id, {"backtest_id": backtest["id"], "strategy_hash": backtest["source_hash"], "mode": "LIVE_DATA_SIMULATED"})
     return get_live_test(live_id)
 

@@ -308,6 +308,8 @@ def test_live_worker_warms_without_orders_then_processes_new_bar(monkeypatch):
     assert running["runtime_state"]["warmup_complete"] is True
     assert running["fills"] == []
     assert running["last_event_at"] == bars[-1]["timestamp"]
+    assert len(running["runtime_state"]["equity_curve"]) == 2
+    assert running["runtime_state"]["equity_curve"][-1]["at"] == bars[-1]["timestamp"]
     # Same event is deduplicated across repeated server cycles.
     service.process_live_tests()
     repeated = client.get(f"/api/live-tests/{created['id']}").json()
