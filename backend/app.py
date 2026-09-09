@@ -97,6 +97,11 @@ def init_db() -> None:
         candidate_columns = {row[1] for row in connection.execute("PRAGMA table_info(candidates)").fetchall()}
         if "archived_at" not in candidate_columns:
             connection.execute("ALTER TABLE candidates ADD COLUMN archived_at TEXT")
+        live_columns = {row[1] for row in connection.execute("PRAGMA table_info(live_tests)").fetchall()}
+        if "runtime_state" not in live_columns:
+            connection.execute("ALTER TABLE live_tests ADD COLUMN runtime_state TEXT NOT NULL DEFAULT '{}'")
+        if "logs" not in live_columns:
+            connection.execute("ALTER TABLE live_tests ADD COLUMN logs TEXT NOT NULL DEFAULT '[]'")
         migrated = connection.execute("SELECT value FROM app_metadata WHERE key='synthetic_data_removed_v1'").fetchone()
         if not migrated:
             # User-confirmed destructive removal: old datasets were deterministic fixtures, never market observations.
@@ -597,6 +602,28 @@ def fetch_alpaca_bars(instrument: str, timeframe: str, start: str, end: str) -> 
     except (KeyError, TypeError, ValueError, json.JSONDecodeError): raise HTTPException(502, "Alpaca market data returned malformed bars")
 
 
+def latest_alpaca_bars(instrument: str, timeframe: str, limit: int = 250) -> list[dict[str, Any]]:
+    row = alpaca_data_connection()
+    mapping = {"1m": "1Min", "5m": "5Min", "15m": "15Min", "1h": "1Hour", "1d": "1Day"}
+    headers = {"APCA-API-KEY-ID": decrypt_secret(row["encrypted_key_id"]), "APCA-API-SECRET-KEY": decrypt_secret(row["encrypted_secret_key"])}
+    try:
+        with httpx.Client(timeout=20, follow_redirects=False) as client:
+            response = client.get(f"{row['base_url']}/v2/stocks/{instrument}/bars", headers=headers, params={"timeframe": mapping[timeframe], "limit": limit, "adjustment": "all", "feed": row["feed"], "sort": "desc"})
+        response.raise_for_status()
+        payload = response.json()
+        page = payload.get("bars") or []
+        if not isinstance(page, list): raise ValueError
+        result = [{"timestamp": item["t"], "open": str(item["o"]), "high": str(item["h"]), "low": str(item["l"]), "close": str(item["c"]), "volume": item["v"]} for item in reversed(page)]
+        for previous, current in zip(result, result[1:]):
+            if current["timestamp"] <= previous["timestamp"]: raise ValueError
+        return result
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in {401, 403}: raise HTTPException(502, "Alpaca market-data authentication or entitlement failed")
+        raise HTTPException(502, f"Alpaca market data returned HTTP {exc.response.status_code}")
+    except (httpx.TimeoutException, httpx.NetworkError): raise HTTPException(504, "Alpaca market data unavailable")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError): raise HTTPException(502, "Alpaca market data returned malformed bars")
+
+
 def test_alpaca(row: sqlite3.Row) -> dict[str, Any]:
     key_id = decrypt_secret(row["encrypted_key_id"])
     secret_key = decrypt_secret(row["encrypted_secret_key"])
@@ -1092,10 +1119,78 @@ def process_due_sessions() -> int:
     return processed
 
 
+def append_live_log(logs: list[dict[str, Any]], level: str, message: str) -> list[dict[str, Any]]:
+    return (logs + [{"at": iso(), "level": level, "message": message}])[-200:]
+
+
+def process_live_tests() -> int:
+    with connect() as connection:
+        rows = connection.execute("SELECT l.*,b.assumptions,c.family FROM live_tests l JOIN backtests b ON b.id=l.backtest_id JOIN candidates c ON c.id=l.candidate_id WHERE l.state NOT IN ('STOPPED','EXPIRED')").fetchall()
+    processed = 0
+    for row in rows:
+        config, runtime = json.loads(row["config"]), json.loads(row["runtime_state"] or "{}")
+        logs = json.loads(row["logs"] or "[]")
+        if datetime.fromisoformat(row["expires_at"]) <= utcnow():
+            with connect() as connection: connection.execute("UPDATE live_tests SET state='EXPIRED',logs=? WHERE id=?", (canonical(append_live_log(logs, "info", "Test expired; virtual positions preserved.")), row["id"]))
+            continue
+        assumptions = json.loads(row["assumptions"])
+        instrument, timeframe = assumptions["instruments"][0], assumptions["timeframe"]
+        params = json.loads(row["parameters_snapshot"])
+        warmup = max(params.values()) + 2
+        try:
+            bars = latest_alpaca_bars(instrument, timeframe, min(1000, warmup + 5))
+        except HTTPException as exc:
+            with connect() as connection: connection.execute("UPDATE live_tests SET state='CONNECTION_ERROR',logs=? WHERE id=?", (canonical(append_live_log(logs, "error", str(exc.detail))), row["id"]))
+            processed += 1; continue
+        if len(bars) < warmup:
+            with connect() as connection: connection.execute("UPDATE live_tests SET state='WARMING_UP',logs=? WHERE id=?", (canonical(append_live_log(logs, "info", f"Warm-up {len(bars)}/{warmup} bars; no orders.")), row["id"]))
+            processed += 1; continue
+        latest = bars[-1]
+        latest_at = datetime.fromisoformat(latest["timestamp"].replace("Z", "+00:00"))
+        max_age = timedelta(minutes=TIMEFRAME_MINUTES[timeframe] * 3 + config["delay_minutes"] + 5)
+        # Daily bars legitimately remain old outside sessions; shorter bars become waiting/stale.
+        stale = timeframe != "1d" and utcnow() - latest_at > max_age
+        if stale:
+            with connect() as connection: connection.execute("UPDATE live_tests SET state='WAITING_FOR_MARKET',last_event_at=?,logs=? WHERE id=?", (latest["timestamp"], canonical(append_live_log(logs, "info", "No fresh eligible bar; waiting for market session.")), row["id"]))
+            processed += 1; continue
+        previous_event = runtime.get("last_processed_at")
+        if previous_event == latest["timestamp"]:
+            processed += 1; continue
+        closes = [Decimal(bar["close"]) for bar in bars]
+        current_position = bool(json.loads(row["positions"] or "[]"))
+        target = desired_position(row["family"], params, closes, len(closes) - 1, current_position)
+        cash, equity = decimal_value(row["virtual_cash"]), decimal_value(row["equity"])
+        positions, fills = json.loads(row["positions"] or "[]"), json.loads(row["fills"] or "[]")
+        pending = runtime.get("pending_target")
+        if pending is not None and bool(pending) != current_position and not row["paused_entries"]:
+            price = decimal_value(latest["open"], positive=True)
+            costs_bps = decimal_value(config["fee_bps"]) + decimal_value(config["spread_bps"]) / 2 + decimal_value(config["slippage_bps"])
+            if pending:
+                notional = min(cash, decimal_value(config["max_position_notional"]))
+                fill_price = price * (1 + costs_bps / 10000)
+                quantity = (notional / fill_price).quantize(Decimal("0.001"), rounding=ROUND_DOWN)
+                if quantity > 0:
+                    cash -= quantity * fill_price; positions = [{"symbol": instrument, "quantity": str(quantity), "average_price": str(fill_price)}]
+                    fills.append({"at": latest["timestamp"], "side": "buy", "quantity": str(quantity), "price": str(fill_price), "simulated": True})
+            elif positions:
+                quantity = decimal_value(positions[0]["quantity"]); fill_price = price * (1 - costs_bps / 10000); cash += quantity * fill_price
+                fills.append({"at": latest["timestamp"], "side": "sell", "quantity": str(quantity), "price": str(fill_price), "simulated": True}); positions = []
+            logs = append_live_log(logs, "info", f"Simulated {'entry' if pending else 'exit'} filled on next eligible bar.")
+        market_value = sum(decimal_value(position["quantity"]) * decimal_value(latest["close"]) for position in positions)
+        equity = cash + market_value
+        runtime = {"last_processed_at": latest["timestamp"], "pending_target": target, "warmup_complete": True, "events_processed": int(runtime.get("events_processed", 0)) + 1}
+        state = "PAUSED_ENTRIES" if row["paused_entries"] else "RUNNING"
+        with connect() as connection:
+            connection.execute("UPDATE live_tests SET state=?,virtual_cash=?,equity=?,positions=?,fills=?,last_event_at=?,runtime_state=?,logs=? WHERE id=?", (state, f"{cash:.2f}", f"{equity:.2f}", canonical(positions), canonical(fills[-500:]), latest["timestamp"], canonical(runtime), canonical(logs), row["id"]))
+        processed += 1
+    return processed
+
+
 async def scheduler(stop: asyncio.Event) -> None:
     while not stop.is_set():
         try:
             process_due_sessions()
+            process_live_tests()
         except Exception:
             pass
         try:
@@ -1420,10 +1515,11 @@ def create_live_test(value: LiveTestInput):
     config = value.model_dump(mode="json", exclude={"confirmation"})
     cash = f"{decimal_value(value.starting_virtual_cash):.2f}"
     expires = utcnow() + timedelta(hours=value.duration_hours)
-    warnings = ["Current market data with app-simulated orders only. No broker order route exists.", "Waiting for configured Alpaca market-data credentials and an eligible market session.", "Simulated fills cannot reproduce queue position or exact broker execution."]
-    state = "WAITING_FOR_DATA"
+    alpaca_data_connection()
+    warnings = ["Current Alpaca market data with app-simulated orders only. No broker order route exists.", "Historical warm-up rebuilds indicators without placing orders.", "Simulated fills cannot reproduce queue position or exact broker execution."]
+    state = "WARMING_UP"
     with connect() as connection:
-        connection.execute("INSERT INTO live_tests VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (live_id, backtest["id"], backtest["candidate_id"], backtest["source_hash"], backtest["source"], backtest["parameters"], backtest["dependency_manifest"], ENGINE_VERSION, state, "LIVE_DATA_SIMULATED", canonical(config), cash, cash, "[]", "[]", "[]", None, iso(), expires.isoformat(), 0, canonical(warnings)))
+        connection.execute("INSERT INTO live_tests(id,backtest_id,candidate_id,strategy_hash,source_snapshot,parameters_snapshot,dependency_snapshot,engine_version,state,mode,config,virtual_cash,equity,positions,pending_orders,fills,last_event_at,created_at,expires_at,paused_entries,warnings,runtime_state,logs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (live_id, backtest["id"], backtest["candidate_id"], backtest["source_hash"], backtest["source"], backtest["parameters"], backtest["dependency_manifest"], ENGINE_VERSION, state, "LIVE_DATA_SIMULATED", canonical(config), cash, cash, "[]", "[]", "[]", None, iso(), expires.isoformat(), 0, canonical(warnings), "{}", canonical([{"at": iso(), "level": "info", "message": "Live-data test created; warm-up queued on server."}])))
     audit("live_test.created", "live_test", live_id, {"backtest_id": backtest["id"], "strategy_hash": backtest["source_hash"], "mode": "LIVE_DATA_SIMULATED"})
     return get_live_test(live_id)
 
@@ -1432,7 +1528,7 @@ def create_live_test(value: LiveTestInput):
 def list_live_tests():
     with connect() as connection:
         rows = connection.execute("SELECT l.*,c.name FROM live_tests l JOIN candidates c ON c.id=l.candidate_id ORDER BY l.created_at DESC").fetchall()
-    return [json_row(row, ("config", "positions", "pending_orders", "fills", "warnings")) for row in rows]
+    return [json_row(row, ("config", "positions", "pending_orders", "fills", "warnings", "runtime_state", "logs")) for row in rows]
 
 
 @app.get("/api/live-tests/{live_id}")
@@ -1441,7 +1537,7 @@ def get_live_test(live_id: str):
         row = connection.execute("SELECT l.*,c.name FROM live_tests l JOIN candidates c ON c.id=l.candidate_id WHERE l.id=?", (live_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Live data test not found")
-    return json_row(row, ("config", "positions", "pending_orders", "fills", "warnings"))
+    return json_row(row, ("config", "positions", "pending_orders", "fills", "warnings", "runtime_state", "logs"))
 
 
 @app.post("/api/live-tests/{live_id}/control")
@@ -1453,7 +1549,7 @@ def control_live_test(live_id: str, value: LiveControlInput):
         if value.action == "pause_entries":
             connection.execute("UPDATE live_tests SET paused_entries=1,state='PAUSED_ENTRIES' WHERE id=?", (live_id,))
         elif value.action == "resume":
-            connection.execute("UPDATE live_tests SET paused_entries=0,state='WAITING_FOR_DATA' WHERE id=?", (live_id,))
+            connection.execute("UPDATE live_tests SET paused_entries=0,state='WARMING_UP' WHERE id=?", (live_id,))
         else:
             connection.execute("UPDATE live_tests SET state='STOPPED',paused_entries=1 WHERE id=?", (live_id,))
     audit(f"live_test.{value.action}", "live_test", live_id, {})

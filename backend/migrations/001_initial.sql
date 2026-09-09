@@ -136,7 +136,9 @@ CREATE TABLE IF NOT EXISTS live_tests (
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
   paused_entries INTEGER NOT NULL DEFAULT 0,
-  warnings TEXT NOT NULL
+  warnings TEXT NOT NULL,
+  runtime_state TEXT NOT NULL DEFAULT '{}',
+  logs TEXT NOT NULL DEFAULT '[]'
 );
 
 CREATE TABLE IF NOT EXISTS jobs (

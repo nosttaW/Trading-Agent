@@ -297,6 +297,34 @@ def test_backtest_fill_is_after_signal_bar():
         assert timestamps.index(trade["entry_time"]) >= 1
 
 
+def test_live_worker_warms_without_orders_then_processes_new_bar(monkeypatch):
+    completed = create_completed_session(); backtest = completed["backtests"][0]
+    created = client.post("/api/live-tests", json={"backtest_id": backtest["id"], "entitlement": "delayed", "delay_minutes": 15, "confirmation": "Start Live Data Test"}).json()
+    bars = service.demo_bars("1d")
+    monkeypatch.setattr(service, "latest_alpaca_bars", lambda *args: bars)
+    assert service.process_live_tests() == 1
+    running = client.get(f"/api/live-tests/{created['id']}").json()
+    assert running["state"] == "RUNNING"
+    assert running["runtime_state"]["warmup_complete"] is True
+    assert running["fills"] == []
+    assert running["last_event_at"] == bars[-1]["timestamp"]
+    # Same event is deduplicated across repeated server cycles.
+    service.process_live_tests()
+    repeated = client.get(f"/api/live-tests/{created['id']}").json()
+    assert repeated["runtime_state"]["events_processed"] == 1
+
+
+def test_live_worker_connection_failure_is_visible(monkeypatch):
+    completed = create_completed_session(); backtest = completed["backtests"][0]
+    created = client.post("/api/live-tests", json={"backtest_id": backtest["id"], "entitlement": "delayed", "delay_minutes": 15, "confirmation": "Start Live Data Test"}).json()
+    def fail(*_): raise service.HTTPException(504, "feed unavailable")
+    monkeypatch.setattr(service, "latest_alpaca_bars", fail)
+    service.process_live_tests()
+    result = client.get(f"/api/live-tests/{created['id']}").json()
+    assert result["state"] == "CONNECTION_ERROR"
+    assert result["logs"][-1]["message"] == "feed unavailable"
+
+
 def test_live_data_test_creates_immutable_fresh_snapshot_without_broker_path():
     completed = create_completed_session()
     backtest = completed["backtests"][0]
@@ -313,7 +341,7 @@ def test_live_data_test_creates_immutable_fresh_snapshot_without_broker_path():
     assert result["strategy_hash"] == detail["source_hash"]
     assert result["virtual_cash"] == result["equity"] == "12000.00"
     assert result["positions"] == result["fills"] == []
-    assert result["state"] == "WAITING_FOR_DATA"
+    assert result["state"] == "WARMING_UP"
     assert client.post("/api/orders", json={"mode": "live"}).status_code == 403
 
 
