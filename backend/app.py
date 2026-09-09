@@ -1119,9 +1119,20 @@ def process_due_sessions() -> int:
     return processed
 
 
+def compact_live_logs(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    for entry in logs:
+        if compacted and (entry.get("level"), entry.get("message")) == (compacted[-1].get("level"), compacted[-1].get("message")):
+            compacted[-1] = entry
+        else:
+            compacted.append(entry)
+    return compacted[-200:]
+
+
 def append_live_log(logs: list[dict[str, Any]], level: str, message: str) -> list[dict[str, Any]]:
+    logs = compact_live_logs(logs)
     if logs and logs[-1].get("level") == level and logs[-1].get("message") == message:
-        return logs[-200:]
+        return logs
     return (logs + [{"at": iso(), "level": level, "message": message}])[-200:]
 
 
@@ -1131,7 +1142,7 @@ def process_live_tests() -> int:
     processed = 0
     for row in rows:
         config, runtime = json.loads(row["config"]), json.loads(row["runtime_state"] or "{}")
-        logs = json.loads(row["logs"] or "[]")
+        logs = compact_live_logs(json.loads(row["logs"] or "[]"))
         if datetime.fromisoformat(row["expires_at"]) <= utcnow():
             with connect() as connection: connection.execute("UPDATE live_tests SET state='EXPIRED',logs=? WHERE id=?", (canonical(append_live_log(logs, "info", "Test expired; virtual positions preserved.")), row["id"]))
             continue
@@ -1161,7 +1172,11 @@ def process_live_tests() -> int:
             runtime["last_poll_at"] = iso()
             runtime["latest_price"] = latest["close"]
             runtime["bars_available"] = len(bars)
-            with connect() as connection: connection.execute("UPDATE live_tests SET runtime_state=? WHERE id=?", (canonical(runtime), row["id"]))
+            if not runtime.get("price_bars"):
+                runtime["price_bars"] = [{key: latest[key] for key in ("timestamp", "open", "high", "low", "close")}]
+            if not runtime.get("equity_curve"):
+                runtime["equity_curve"] = [{"at": row["created_at"], "value": float(decimal_value(config["starting_virtual_cash"]))}, {"at": latest["timestamp"], "value": float(decimal_value(row["equity"]))}]
+            with connect() as connection: connection.execute("UPDATE live_tests SET runtime_state=?,logs=? WHERE id=?", (canonical(runtime), canonical(logs), row["id"]))
             processed += 1; continue
         closes = [Decimal(bar["close"]) for bar in bars]
         current_position = bool(json.loads(row["positions"] or "[]"))
