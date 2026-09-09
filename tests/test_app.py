@@ -10,9 +10,12 @@ from fastapi.testclient import TestClient
 TEST_DB = Path(__file__).parent / "test-trading.db"
 os.environ["TRADING_DB_PATH"] = str(TEST_DB)
 os.environ["APP_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+os.environ["SESSION_SECRET"] = "test-session-secret-that-is-at-least-32-characters"
+os.environ["COOKIE_SECURE"] = "false"
 sys.path.insert(0, str(Path(__file__).parents[1] / "backend"))
 import app as service
 
+os.environ["ADMIN_PASSWORD_HASH"] = service.password_hash("correct horse battery staple")
 client = TestClient(service.app)
 
 
@@ -21,6 +24,10 @@ def clean_database():
     if TEST_DB.exists():
         TEST_DB.unlink()
     service.init_db()
+    service.LOGIN_FAILURES.clear()
+    login = client.post("/api/auth/login", json={"password": "correct horse battery staple"})
+    assert login.status_code == 200
+    client.headers["x-csrf-token"] = login.json()["csrf_token"]
     yield
     if TEST_DB.exists():
         TEST_DB.unlink()
@@ -44,6 +51,35 @@ def create_completed_session():
     assert started["state"] == "GENERATING"
     completed = client.post(f"/api/research-sessions/{created['id']}/control", json={"action": "stop"}).json()
     return completed
+
+
+def test_authentication_and_csrf_enforced():
+    anonymous = TestClient(service.app)
+    assert anonymous.get("/api/providers").status_code == 401
+    assert anonymous.post("/api/auth/login", json={"password": "wrong password"}).status_code == 401
+    login = anonymous.post("/api/auth/login", json={"password": "correct horse battery staple"})
+    assert login.status_code == 200
+    assert login.cookies.get(service.SESSION_COOKIE)
+    assert "HttpOnly" in login.headers["set-cookie"] and "SameSite=strict" in login.headers["set-cookie"]
+    assert anonymous.get("/api/providers").status_code == 200
+    assert anonymous.post("/api/research-sessions", json=session_config()).status_code == 403
+    anonymous.headers["x-csrf-token"] = login.json()["csrf_token"]
+    assert anonymous.post("/api/research-sessions", json=session_config()).status_code == 200
+    assert anonymous.post("/api/auth/logout").status_code == 200
+    assert anonymous.get("/api/providers").status_code == 401
+
+
+def test_tampered_session_rejected():
+    anonymous = TestClient(service.app)
+    anonymous.cookies.set(service.SESSION_COOKIE, "tampered.token")
+    assert anonymous.get("/api/providers").status_code == 401
+
+
+def test_login_rate_limit():
+    anonymous = TestClient(service.app)
+    for _ in range(service.LOGIN_MAX_FAILURES):
+        assert anonymous.post("/api/auth/login", json={"password": "wrong"}).status_code == 401
+    assert anonymous.post("/api/auth/login", json={"password": "correct horse battery staple"}).status_code == 429
 
 
 def test_status_fails_closed_for_execution():

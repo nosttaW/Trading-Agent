@@ -12,6 +12,7 @@ WORKDIR /app
 COPY backend/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt && useradd --create-home --uid 10001 app
 COPY backend/app.py ./app.py
+COPY backend/auth_cli.py ./auth_cli.py
 COPY backend/migrations ./migrations
 COPY --from=frontend /src/frontend/dist ./static
 RUN mkdir /data && chown -R app:app /app /data

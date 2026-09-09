@@ -2,6 +2,7 @@
 
 ## Enforced now
 
+- Single-admin password authentication protects every non-health API. PBKDF2-HMAC-SHA256 uses 600,000 iterations and a random salt. Signed 12-hour HttpOnly/SameSite=Strict sessions carry a session-bound CSRF token. Five failed attempts per client trigger a 15-minute lockout.
 - AI credentials originate server-side. Fernet authenticated encryption uses deployment-managed `APP_ENCRYPTION_KEY`.
 - Saved keys/custom headers return masked/boolean status only. Authorization content never enters audit payloads.
 - Remote AI endpoint default: HTTPS/443. DNS resolves before call. Private, loopback, metadata/link-local, reserved, multicast, credentials-in-URL, redirects, unsafe headers blocked.
@@ -40,7 +41,9 @@ No Alpaca credentials, account calls, orders, cancel, replacement, streaming, or
 
 ## Production gaps
 
-Current app is local single-user software. It does not yet implement authentication, resource ownership, CSRF sessions, PostgreSQL multi-instance leases, hardened reverse proxy headers, external KMS, egress firewall, encrypted DB volume, WORM audit storage, remote market-data ingestion, alerting, or independent risk supervisor. Do not expose publicly or trade with it.
+Current app is local single-admin software. It does not yet implement multi-user ownership, password reset/recovery, MFA, PostgreSQL multi-instance leases, hardened reverse proxy headers, external KMS, egress firewall, encrypted DB volume, WORM audit storage, remote market-data ingestion, alerting, or independent risk supervisor. Do not expose publicly or trade with it.
+
+LAN HTTP requires `COOKIE_SECURE=false`; passwords and cookies can be intercepted by a hostile network participant. Cloudflare Tunnel cutover must enforce HTTPS, trusted-host/origin rules, and `COOKIE_SECURE=true`. Password authentication alone does not satisfy the stronger reauthentication requirement for real-money approval.
 
 DNS validation has a resolution/request TOCTOU window because `httpx` resolves independently. Production must pin validated addresses through a controlled egress proxy/resolver and revalidate every redirect (redirects currently rejected).
 

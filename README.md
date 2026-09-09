@@ -17,12 +17,16 @@ Responsive strategy-research software: persistent 15-minute sessions, configurab
 
 `ENABLE_LIVE_TRADING=true` **does not enable orders**. `/api/orders` always returns `403`. Research, backtesting, and live-data-test creation cannot place broker orders.
 
+Single-admin password authentication protects every non-health API. Passwords use PBKDF2-HMAC-SHA256 with 600,000 iterations; only the encoded hash is configured. Sessions are signed, 12-hour, HttpOnly, SameSite=Strict cookies. Mutations require a session-bound CSRF token. Five failed attempts per client trigger a 15-minute lockout. Current LAN HTTP needs `COOKIE_SECURE=false`; switch to `true` immediately when HTTPS terminates through Cloudflare Tunnel.
+
 ## Local startup
 
 ```bash
 cp .env.example .env
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 # Paste output into APP_ENCRYPTION_KEY in .env
+python -m backend.auth_cli hash-password
+# Paste output into ADMIN_PASSWORD_HASH. Generate SESSION_SECRET per .env.example.
 python -m pip install -r backend/requirements.txt pytest
 python -m uvicorn --app-dir backend app:app --reload
 ```

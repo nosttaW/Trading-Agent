@@ -8,13 +8,16 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import ipaddress
 import json
 import math
 import os
+import secrets
 import socket
 import sqlite3
 import statistics
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -25,8 +28,9 @@ from urllib.parse import urlparse
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -40,6 +44,11 @@ PROMPT_VERSION = "reviewed-template-v1"
 DISCLAIMER = "Backtests and simulations do not predict future returns. Execution can differ materially. Losses can exceed risk thresholds during gaps, slippage, or outages."
 SESSION_STATES = {"DRAFT", "GENERATING", "PAUSED", "STOPPING", "BACKTESTING", "COMPLETED", "COMPLETED_WITH_ERRORS", "CANCELED", "FAILED"}
 ALLOWED_REMOTE_PORTS = {443}
+SESSION_COOKIE = "strategy_lab_session"
+SESSION_TTL_SECONDS = 12 * 60 * 60
+LOGIN_WINDOW_SECONDS = 15 * 60
+LOGIN_MAX_FAILURES = 5
+LOGIN_FAILURES: dict[str, list[float]] = {}
 
 
 def utcnow() -> datetime:
@@ -228,12 +237,84 @@ class LiveTestInput(BaseModel):
         return self
 
 
+class LoginInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    password: str = Field(min_length=1, max_length=1024)
+
+
 class ControlInput(BaseModel):
     action: Literal["pause", "resume", "stop", "stop_immediately", "cancel"]
 
 
 class LiveControlInput(BaseModel):
     action: Literal["pause_entries", "resume", "stop"]
+
+
+def password_hash(password: str, salt: bytes | None = None, iterations: int = 600_000) -> str:
+    """PBKDF2-HMAC-SHA256 encoded for ADMIN_PASSWORD_HASH."""
+    salt = salt or secrets.token_bytes(16)
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${base64.urlsafe_b64encode(salt).decode()}${base64.urlsafe_b64encode(derived).decode()}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, raw_iterations, raw_salt, raw_expected = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        iterations = int(raw_iterations)
+        if not 100_000 <= iterations <= 2_000_000:
+            return False
+        salt = base64.urlsafe_b64decode(raw_salt.encode())
+        expected = base64.urlsafe_b64decode(raw_expected.encode())
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+        return secrets.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def auth_secret() -> bytes:
+    value = os.getenv("SESSION_SECRET")
+    if not value or len(value) < 32:
+        raise HTTPException(503, "SESSION_SECRET must contain at least 32 characters")
+    return value.encode()
+
+
+def session_token(csrf: str, expires: int) -> str:
+    payload = base64.urlsafe_b64encode(canonical({"sub": "admin", "csrf": csrf, "exp": expires}).encode()).decode().rstrip("=")
+    signature = hmac.new(auth_secret(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def read_session(token: str | None) -> dict[str, Any] | None:
+    if not token:
+        return None
+    try:
+        payload, signature = token.rsplit(".", 1)
+        expected = hmac.new(auth_secret(), payload.encode(), hashlib.sha256).hexdigest()
+        if not secrets.compare_digest(signature, expected):
+            return None
+        decoded = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        if decoded.get("sub") != "admin" or int(decoded.get("exp", 0)) <= int(time.time()) or not isinstance(decoded.get("csrf"), str):
+            return None
+        return decoded
+    except (ValueError, TypeError, json.JSONDecodeError, HTTPException):
+        return None
+
+
+def secure_cookie() -> bool:
+    return os.getenv("COOKIE_SECURE", "true").lower() == "true"
+
+
+def client_key(request: Request) -> str:
+    # Do not trust forwarded headers unless a reviewed proxy normalizes them.
+    return request.client.host if request.client else "unknown"
+
+
+def login_allowed(key: str) -> bool:
+    cutoff = time.time() - LOGIN_WINDOW_SECONDS
+    LOGIN_FAILURES[key] = [attempt for attempt in LOGIN_FAILURES.get(key, []) if attempt > cutoff]
+    return len(LOGIN_FAILURES[key]) < LOGIN_MAX_FAILURES
 
 
 def encryption() -> Fernet:
@@ -675,12 +756,62 @@ async def lifespan(_: FastAPI):
 
 init_db()
 app = FastAPI(title="Strategy Lab", version="2.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=[item for item in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if item], allow_credentials=False, allow_methods=["GET", "POST", "DELETE"], allow_headers=["content-type"])
+app.add_middleware(CORSMiddleware, allow_origins=[item for item in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if item], allow_credentials=True, allow_methods=["GET", "POST", "DELETE"], allow_headers=["content-type", "x-csrf-token"])
+
+PUBLIC_API_PATHS = {"/api/status", "/api/health", "/api/readiness", "/api/auth/session", "/api/auth/login"}
+
+
+@app.middleware("http")
+async def authenticate(request: Request, call_next):
+    if not request.url.path.startswith("/api/") or request.url.path in PUBLIC_API_PATHS:
+        return await call_next(request)
+    session = read_session(request.cookies.get(SESSION_COOKIE))
+    if not session:
+        return JSONResponse({"detail": "Authentication required"}, status_code=401)
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not secrets.compare_digest(request.headers.get("x-csrf-token", ""), session["csrf"]):
+        return JSONResponse({"detail": "CSRF validation failed"}, status_code=403)
+    request.state.user = session["sub"]
+    return await call_next(request)
 
 
 @app.get("/api/status")
 def status():
-    return {"status": "ok", "mode": "DEMO", "live_trading_enabled": False, "arbitrary_python_enabled": False, "broker_submission_enabled": False, "engine_version": ENGINE_VERSION, "engine_hash": ENGINE_HASH, "disclaimer": DISCLAIMER}
+    return {"status": "ok", "mode": "DEMO", "authentication_required": True, "live_trading_enabled": False, "arbitrary_python_enabled": False, "broker_submission_enabled": False, "engine_version": ENGINE_VERSION, "engine_hash": ENGINE_HASH, "disclaimer": DISCLAIMER}
+
+
+@app.get("/api/auth/session")
+def auth_session(request: Request):
+    session = read_session(request.cookies.get(SESSION_COOKIE))
+    return {"authenticated": bool(session), "user": session["sub"] if session else None, "csrf_token": session["csrf"] if session else None}
+
+
+@app.post("/api/auth/login")
+def login(value: LoginInput, request: Request, response: Response):
+    key = client_key(request)
+    if not login_allowed(key):
+        raise HTTPException(429, "Too many failed attempts. Try again in 15 minutes.")
+    configured = os.getenv("ADMIN_PASSWORD_HASH", "")
+    if not configured:
+        raise HTTPException(503, "ADMIN_PASSWORD_HASH is not configured")
+    if not verify_password(value.password, configured):
+        LOGIN_FAILURES.setdefault(key, []).append(time.time())
+        audit("auth.login_failed", "user", "admin", {"client": key}, actor="anonymous")
+        # Hash work already dominates; fixed delay limits online guessing further.
+        time.sleep(0.5)
+        raise HTTPException(401, "Invalid password")
+    LOGIN_FAILURES.pop(key, None)
+    csrf = secrets.token_urlsafe(32)
+    expires = int(time.time()) + SESSION_TTL_SECONDS
+    response.set_cookie(SESSION_COOKIE, session_token(csrf, expires), max_age=SESSION_TTL_SECONDS, httponly=True, secure=secure_cookie(), samesite="strict", path="/")
+    audit("auth.login_succeeded", "user", "admin", {"client": key})
+    return {"authenticated": True, "user": "admin", "csrf_token": csrf, "expires_at": datetime.fromtimestamp(expires, UTC).isoformat()}
+
+
+@app.post("/api/auth/logout")
+def logout(response: Response):
+    response.delete_cookie(SESSION_COOKIE, path="/", secure=secure_cookie(), httponly=True, samesite="strict")
+    audit("auth.logout", "user", "admin", {})
+    return {"authenticated": False}
 
 
 @app.get("/api/health")
