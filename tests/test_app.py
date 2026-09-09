@@ -200,7 +200,7 @@ def test_paper_approval_starts_halted_and_binds_hash(monkeypatch):
     approved, _ = paper_ready(monkeypatch)
     assert approved["mode"] == "BROKER_PAPER"
     assert approved["state"] == "HALTED" and approved["emergency_stop"] == 1
-    assert approved["strategy_hash"] and approved["engine_hash"] == service.ENGINE_HASH
+    assert approved["strategy_hash"] and approved["engine_hash"] == service.PAPER_ENGINE_HASH
     assert approved["broker_account_id"] == "paper-account-1"
     assert approved["limits"]["capital_allocation"] == "9000.00"
     assert approved["limits"]["max_order_notional"] == "900.00"

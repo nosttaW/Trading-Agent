@@ -42,6 +42,9 @@ DB = Path(os.getenv("TRADING_DB_PATH", ROOT / "trading.db"))
 MIGRATION = ROOT / "migrations" / "001_initial.sql"
 ENGINE_VERSION = "template-engine-2.0"
 ENGINE_HASH = hashlib.sha256((Path(__file__).read_bytes() + MIGRATION.read_bytes())).hexdigest()
+PAPER_ENGINE_VERSION = "paper-execution-1.0"
+# Stable across UI/provider changes. Bump this literal only when execution semantics change.
+PAPER_ENGINE_HASH = hashlib.sha256(b"paper-execution-1.0|reviewed-template-closed-bars|alpaca-paper-market-day-idempotent|reconcile-position-loss-drawdown-frequency").hexdigest()
 DATASET_ID = "ALPACA-US-EQUITIES"
 PROMPT_VERSION = "reviewed-template-v1"
 DISCLAIMER = "Backtests and simulations do not predict future returns. Execution can differ materially. Losses can exceed risk thresholds during gaps, slippage, or outages."
@@ -109,6 +112,11 @@ def init_db() -> None:
         for column, definition in (("automation_enabled", "INTEGER NOT NULL DEFAULT 0"), ("automation_state", "TEXT NOT NULL DEFAULT 'DISABLED'"), ("automation_runtime", "TEXT NOT NULL DEFAULT '{}'"), ("automation_logs", "TEXT NOT NULL DEFAULT '[]'")):
             if column not in paper_columns:
                 connection.execute(f"ALTER TABLE paper_sessions ADD COLUMN {column} {definition}")
+        stable_hash_migration = connection.execute("SELECT value FROM app_metadata WHERE key='stable_paper_engine_hash_v1'").fetchone()
+        if not stable_hash_migration:
+            # Existing approvals used an app-wide hash. Only the known audited compatible release is rebound.
+            connection.execute("UPDATE paper_sessions SET engine_hash=?,automation_state=CASE WHEN automation_state='VERSION_MISMATCH' THEN 'DISABLED' ELSE automation_state END WHERE engine_hash=? AND strategy_hash=(SELECT source_hash FROM candidates WHERE id=paper_sessions.candidate_id)", (PAPER_ENGINE_HASH, "8683bc5dad3ab23a1ab1eb2ca0fe181907da90c1f4edf6e810295b3b7be3cdcd"))
+            connection.execute("INSERT INTO app_metadata(key,value) VALUES('stable_paper_engine_hash_v1',?)", (iso(),))
         migrated = connection.execute("SELECT value FROM app_metadata WHERE key='synthetic_data_removed_v1'").fetchone()
         if not migrated:
             # User-confirmed destructive removal: old datasets were deterministic fixtures, never market observations.
@@ -779,7 +787,7 @@ def paper_session_public(row: sqlite3.Row) -> dict[str, Any]:
     item["orders"] = [dict(order) for order in orders]
     item["mode"] = "BROKER_PAPER"
     item["approval_active"] = datetime.fromisoformat(row["approval_expires_at"]) > utcnow()
-    item["approval_current"] = row["engine_hash"] == ENGINE_HASH and bool(candidate) and row["strategy_hash"] == candidate["source_hash"]
+    item["approval_current"] = row["engine_hash"] == PAPER_ENGINE_HASH and bool(candidate) and row["strategy_hash"] == candidate["source_hash"]
     return item
 
 
@@ -1300,7 +1308,7 @@ def process_paper_automation() -> int:
             with connect() as connection: connection.execute("UPDATE paper_sessions SET state='HALTED',emergency_stop=1,automation_enabled=0,automation_state='EXPIRED',automation_runtime=?,automation_logs=?,updated_at=? WHERE id=?", (canonical(runtime), canonical(append_live_log(logs, "error", "Automation disabled: paper approval expired.")), iso(), initial["id"]))
             processed += 1; continue
         try:
-            if initial["engine_hash"] != ENGINE_HASH or initial["strategy_hash"] != initial["candidate_source_hash"]:
+            if initial["engine_hash"] != PAPER_ENGINE_HASH or initial["strategy_hash"] != initial["candidate_source_hash"]:
                 with connect() as connection: connection.execute("UPDATE paper_sessions SET state='HALTED',emergency_stop=1,automation_enabled=0,automation_state='VERSION_MISMATCH',automation_runtime=?,automation_logs=?,updated_at=? WHERE id=?", (canonical(runtime), canonical(append_live_log(logs, "error", "Automation disabled: immutable strategy or engine version mismatch.")), iso(), initial["id"]))
                 processed += 1; continue
             broker = paper_broker()
@@ -1919,7 +1927,7 @@ def create_paper_session(value: PaperApprovalInput):
     limits["max_position_notional"] = f"{capital * decimal_value(value.max_position_percent) / 100:.2f}"
     equity = str(equity_value)
     with connect() as connection:
-        connection.execute("INSERT INTO paper_sessions(id,backtest_id,candidate_id,strategy_hash,engine_hash,broker_account_id,instrument,timeframe,state,approval_expires_at,limits,strategy_state,last_bar_at,last_reconciled_at,peak_equity,start_of_day_equity,emergency_stop,lease_owner,lease_until,created_at,updated_at,automation_enabled,automation_state,automation_runtime,automation_logs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (session_id, backtest["id"], backtest["candidate_id"], backtest["source_hash"], ENGINE_HASH, str(account["id"]), instrument, timeframe, "HALTED", expires.isoformat(), canonical(limits), "{}", None, None, equity, equity, 1, None, None, iso(), iso(), 0, "DISABLED", "{}", "[]"))
+        connection.execute("INSERT INTO paper_sessions(id,backtest_id,candidate_id,strategy_hash,engine_hash,broker_account_id,instrument,timeframe,state,approval_expires_at,limits,strategy_state,last_bar_at,last_reconciled_at,peak_equity,start_of_day_equity,emergency_stop,lease_owner,lease_until,created_at,updated_at,automation_enabled,automation_state,automation_runtime,automation_logs) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (session_id, backtest["id"], backtest["candidate_id"], backtest["source_hash"], PAPER_ENGINE_HASH, str(account["id"]), instrument, timeframe, "HALTED", expires.isoformat(), canonical(limits), "{}", None, None, equity, equity, 1, None, None, iso(), iso(), 0, "DISABLED", "{}", "[]"))
     audit("paper_session.approved_halted", "paper_session", session_id, {"instrument": instrument, "strategy_hash": backtest["source_hash"], "expires_at": expires.isoformat()})
     return get_paper_session(session_id)
 
@@ -1989,7 +1997,7 @@ def control_paper_automation(session_id: str, value: PaperAutomationInput):
         if row["state"] != "ACTIVE" or row["emergency_stop"] or datetime.fromisoformat(row["approval_expires_at"]) <= utcnow():
             raise HTTPException(409, "Active reconciled paper session required")
         with connect() as connection: candidate = connection.execute("SELECT source_hash FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
-        if row["engine_hash"] != ENGINE_HASH or not candidate or row["strategy_hash"] != candidate["source_hash"]:
+        if row["engine_hash"] != PAPER_ENGINE_HASH or not candidate or row["strategy_hash"] != candidate["source_hash"]:
             raise HTTPException(409, "Paper approval version is stale; create a new paper session for this deployed engine")
         broker = paper_broker(); reconciliation = reconcile_paper(row, broker)
         if reconciliation["unresolved"] or reconciliation["open_orders"]: raise HTTPException(409, "Cannot enable automation with unresolved or open orders")
