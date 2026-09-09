@@ -1943,6 +1943,9 @@ def control_paper_automation(session_id: str, value: PaperAutomationInput):
         if value.confirmation != expected: raise HTTPException(422, f"Type exactly: {expected}")
         if row["state"] != "ACTIVE" or row["emergency_stop"] or datetime.fromisoformat(row["approval_expires_at"]) <= utcnow():
             raise HTTPException(409, "Active reconciled paper session required")
+        with connect() as connection: candidate = connection.execute("SELECT source_hash FROM candidates WHERE id=?", (row["candidate_id"],)).fetchone()
+        if row["engine_hash"] != ENGINE_HASH or not candidate or row["strategy_hash"] != candidate["source_hash"]:
+            raise HTTPException(409, "Paper approval version is stale; create a new paper session for this deployed engine")
         broker = paper_broker(); reconciliation = reconcile_paper(row, broker)
         if reconciliation["unresolved"] or reconciliation["open_orders"]: raise HTTPException(409, "Cannot enable automation with unresolved or open orders")
         runtime = {"last_poll_at": None, "last_evaluated_bar_at": None, "signal": None, "consecutive_failures": 0}

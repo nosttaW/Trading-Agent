@@ -207,6 +207,14 @@ def enable_automation(approved):
     return client.post(f"/api/paper-sessions/{approved['id']}/automation", json={"enabled": True, "confirmation": expected})
 
 
+def test_stale_engine_approval_cannot_enable_automation(monkeypatch):
+    approved, fake = paper_ready(monkeypatch)
+    client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})
+    with service.connect() as connection: connection.execute("UPDATE paper_sessions SET engine_hash='old-engine' WHERE id=?", (approved["id"],))
+    result = enable_automation(approved)
+    assert result.status_code == 409 and fake.submissions == []
+
+
 def test_paper_automation_requires_separate_opt_in(monkeypatch):
     approved, fake = paper_ready(monkeypatch)
     assert approved["automation_enabled"] == 0 and approved["automation_state"] == "DISABLED"
