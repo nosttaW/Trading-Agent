@@ -140,6 +140,21 @@ CREATE TABLE IF NOT EXISTS backtests (
   UNIQUE(candidate_id, dataset_hash, engine_hash)
 );
 
+CREATE TABLE IF NOT EXISTS strategy_reviews (
+  id TEXT PRIMARY KEY,
+  backtest_id TEXT NOT NULL REFERENCES backtests(id),
+  provider_id TEXT NOT NULL REFERENCES providers(id),
+  model_id TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  strengths TEXT NOT NULL,
+  weaknesses TEXT NOT NULL,
+  recommendations TEXT NOT NULL,
+  evidence_snapshot_hash TEXT NOT NULL,
+  token_usage INTEGER,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS live_tests (
   id TEXT PRIMARY KEY,
   backtest_id TEXT NOT NULL REFERENCES backtests(id),
@@ -207,7 +222,8 @@ CREATE TABLE IF NOT EXISTS paper_sessions (
   automation_enabled INTEGER NOT NULL DEFAULT 0,
   automation_state TEXT NOT NULL DEFAULT 'DISABLED',
   automation_runtime TEXT NOT NULL DEFAULT '{}',
-  automation_logs TEXT NOT NULL DEFAULT '[]'
+  automation_logs TEXT NOT NULL DEFAULT '[]',
+  archived_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS paper_orders (

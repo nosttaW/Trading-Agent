@@ -196,6 +196,20 @@ def paper_ready(monkeypatch):
     return approved, fake
 
 
+def test_inactive_flat_paper_session_can_be_archived(monkeypatch):
+    approved, _ = paper_ready(monkeypatch)
+    result = client.delete(f"/api/paper-sessions/{approved['id']}")
+    assert result.status_code == 200 and result.json()["history_preserved"] is True
+    assert all(item["id"] != approved["id"] for item in client.get("/api/paper-sessions").json())
+    with service.connect() as connection: assert connection.execute("SELECT archived_at FROM paper_sessions WHERE id=?", (approved["id"],)).fetchone()[0]
+
+
+def test_active_paper_session_cannot_be_archived(monkeypatch):
+    approved, _ = paper_ready(monkeypatch)
+    client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})
+    assert client.delete(f"/api/paper-sessions/{approved['id']}").status_code == 409
+
+
 def test_paper_approval_starts_halted_and_binds_hash(monkeypatch):
     approved, _ = paper_ready(monkeypatch)
     assert approved["mode"] == "BROKER_PAPER"
@@ -535,6 +549,17 @@ def test_live_data_test_creates_immutable_fresh_snapshot_without_broker_path():
     assert result["positions"] == result["fills"] == []
     assert result["state"] == "WARMING_UP"
     assert client.post("/api/orders", json={"mode": "live"}).status_code == 403
+
+
+def test_ai_strategy_review_is_stored_without_mutating_backtest(monkeypatch):
+    completed = create_completed_session(monkeypatch); backtest = completed["backtests"][0]
+    with service.connect() as connection:
+        connection.execute("INSERT INTO providers VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("reviewer", "Reviewer", "https://api.example.com/v1", "chat_completions", "model", service.encrypt_secret("secret"), service.encrypt_secret({}), 2, 1000, 0.2, 1, 0, None, None, service.iso(), service.iso()))
+    monkeypatch.setattr(service, "provider_json", lambda *_: ({"verdict": "PAPER_CANDIDATE", "summary": "Evidence remains weak and requires independent validation.", "strengths": ["Chronological fills"], "weaknesses": ["Benchmark underperformance"], "recommendations": ["Retest"], "follow_up": None}, 10))
+    result = client.post(f"/api/backtests/{backtest['id']}/reviews", json={"provider_id": "reviewer", "create_follow_up": False})
+    assert result.status_code == 200 and result.json()["review"]["verdict"] == "REJECT"
+    assert len(client.get(f"/api/backtests/{backtest['id']}/reviews").json()) == 1
+    assert client.get(f"/api/backtests/{backtest['id']}").json()["metrics"] == backtest["metrics"]
 
 
 def test_live_data_delay_must_be_truthfully_labeled():
