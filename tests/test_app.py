@@ -128,6 +128,25 @@ def test_explicit_local_endpoint_allowlist(monkeypatch):
     assert result.status_code == 200, result.text
 
 
+def test_provider_model_discovery_returns_sorted_ids_without_saving(monkeypatch):
+    class Response:
+        status_code = 200
+        content = b'{}'
+        def raise_for_status(self): pass
+        def json(self): return {"data": [{"id": "model-z"}, {"id": "model-a"}, {"bad": True}]}
+    class Client:
+        def __init__(self, **_): pass
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def get(self, *_, **__): return Response()
+    monkeypatch.setattr(service.httpx, "Client", Client)
+    monkeypatch.setattr(service, "validate_endpoint", lambda value: value.rstrip("/"))
+    payload = {"name": "Compatible API", "base_url": "https://api.example.com/v1", "api_key": "secret-key", "model_id": "manual", "profile": "chat_completions"}
+    result = client.post("/api/providers/discover-models", json=payload)
+    assert result.status_code == 200 and result.json()["models"] == ["model-a", "model-z"]
+    assert client.get("/api/providers").json() == []
+
+
 def test_unsafe_custom_headers_rejected():
     result = client.post("/api/providers", json={"name": "Unsafe", "base_url": "https://api.openai.com/v1", "model_id": "model", "custom_headers": {"Authorization": "secret"}})
     assert result.status_code == 422

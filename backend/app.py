@@ -513,13 +513,17 @@ def provider_public(row: sqlite3.Row) -> dict[str, Any]:
     return item
 
 
-def provider_request(row: sqlite3.Row, purpose: str) -> tuple[str, dict[str, Any], dict[str, str]]:
-    base_url = validate_endpoint(row["base_url"])
+def provider_headers(row: sqlite3.Row) -> dict[str, str]:
     key = decrypt_secret(row["encrypted_api_key"])
     custom = decrypt_secret(row["encrypted_headers"]) or {}
     headers = {"content-type": "application/json", **custom}
-    if key:
-        headers["authorization"] = f"Bearer {key}"
+    if key: headers["authorization"] = f"Bearer {key}"
+    return headers
+
+
+def provider_request(row: sqlite3.Row, purpose: str) -> tuple[str, dict[str, Any], dict[str, str]]:
+    base_url = validate_endpoint(row["base_url"])
+    headers = provider_headers(row)
     if row["profile"] == "chat_completions":
         url = f"{base_url}/chat/completions"
         body: dict[str, Any] = {"model": row["model_id"], "messages": [{"role": "user", "content": purpose}], "max_tokens": min(row["max_output_tokens"], 2000), "stream": False}
@@ -1313,14 +1317,14 @@ def process_paper_automation() -> int:
             latest_at = datetime.fromisoformat(latest["timestamp"].replace("Z", "+00:00"))
             if row["timeframe"] != "1d" and utcnow() - latest_at > timedelta(minutes=TIMEFRAME_MINUTES[row["timeframe"]] * 3 + 5):
                 raise HTTPException(409, "No fresh closed bar; waiting for market data")
-            runtime.update({"latest_bar_at": latest["timestamp"], "latest_price": latest["close"], "warmup_complete": True, "consecutive_failures": 0, "last_error": None})
+            runtime.update({"latest_bar_at": latest["timestamp"], "latest_price": latest["close"], "account_equity": reconciliation["account"]["equity"], "account_cash": reconciliation["account"]["cash"], "buying_power": reconciliation["account"]["buying_power"], "warmup_complete": True, "consecutive_failures": 0, "last_error": None})
             if runtime.get("last_evaluated_bar_at") == latest["timestamp"]:
                 with connect() as connection: connection.execute("UPDATE paper_sessions SET automation_state='RUNNING',automation_runtime=?,automation_logs=?,updated_at=? WHERE id=?", (canonical(runtime), canonical(logs), iso(), row["id"]))
                 processed += 1; continue
             positions = [position for position in reconciliation["positions"] if position.get("symbol") == row["instrument"]]
             current = bool(positions and decimal_value(positions[0].get("qty", "0")) > 0)
             target = desired_position(row["family"], params, [Decimal(bar["close"]) for bar in bars], len(bars)-1, current)
-            runtime.update({"last_evaluated_bar_at": latest["timestamp"], "signal": "LONG" if target else "FLAT"})
+            runtime.update({"last_evaluated_bar_at": latest["timestamp"], "signal": "LONG" if target else "FLAT", "position_state": "LONG" if current else "CASH", "entry_status": "READY" if not current and target else "WAITING_FOR_LONG_SIGNAL" if not current else "IN_POSITION"})
             order = None
             if (row["state"] == "ACTIVE" or recovered) and target != current:
                 reference = decimal_value(latest["close"], positive=True)
@@ -1570,6 +1574,45 @@ def save_provider(value: ProviderInput):
         row = connection.execute("SELECT * FROM providers WHERE id=?", (provider_id,)).fetchone()
     audit("provider.saved", "provider", provider_id, {"name": value.name, "base_url": base_url, "profile": value.profile})
     return provider_public(row)
+
+
+def fetch_provider_models(base_url: str, headers: dict[str, str], timeout: int) -> list[str]:
+    url = f"{validate_endpoint(base_url)}/models"
+    try:
+        with httpx.Client(timeout=min(timeout, 30), follow_redirects=False) as client:
+            response = client.get(url, headers=headers)
+        if 300 <= response.status_code < 400: raise HTTPException(502, "Provider model-list redirect rejected")
+        response.raise_for_status()
+        if len(response.content) > 1_000_000: raise HTTPException(502, "Provider model list exceeded size limit")
+        payload = response.json(); data = payload.get("data")
+        if not isinstance(data, list): raise ValueError
+        models = sorted({item["id"] for item in data if isinstance(item, dict) and isinstance(item.get("id"), str) and 0 < len(item["id"]) <= 200})
+        if not models: raise ValueError
+    except HTTPException: raise
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in {401, 403}: raise HTTPException(502, "Provider model discovery authentication failed")
+        raise HTTPException(502, f"Provider model discovery returned HTTP {exc.response.status_code}")
+    except (httpx.TimeoutException, httpx.NetworkError): raise HTTPException(504, "Provider model discovery timed out")
+    except (ValueError, json.JSONDecodeError): raise HTTPException(502, "Provider returned malformed model list")
+    return models
+
+
+@app.post("/api/providers/discover-models")
+def discover_unsaved_provider_models(value: ProviderInput):
+    headers = {"content-type": "application/json", **value.custom_headers}
+    if value.api_key: headers["authorization"] = f"Bearer {value.api_key}"
+    models = fetch_provider_models(value.base_url, headers, value.timeout_seconds)
+    audit("provider.models_discovered", "provider", "unsaved", {"count": len(models), "base_url": validate_endpoint(value.base_url)})
+    return {"models": models, "selected": value.model_id}
+
+
+@app.get("/api/providers/{provider_id}/models")
+def discover_provider_models(provider_id: str):
+    with connect() as connection: row = connection.execute("SELECT * FROM providers WHERE id=?", (provider_id,)).fetchone()
+    if not row: raise HTTPException(404, "Provider not found")
+    models = fetch_provider_models(row["base_url"], provider_headers(row), row["timeout_seconds"])
+    audit("provider.models_discovered", "provider", provider_id, {"count": len(models)})
+    return {"models": models, "selected": row["model_id"]}
 
 
 @app.delete("/api/providers/{provider_id}")
