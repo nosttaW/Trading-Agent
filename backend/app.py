@@ -608,7 +608,7 @@ def latest_alpaca_bars(instrument: str, timeframe: str, limit: int = 250) -> lis
     headers = {"APCA-API-KEY-ID": decrypt_secret(row["encrypted_key_id"]), "APCA-API-SECRET-KEY": decrypt_secret(row["encrypted_secret_key"])}
     try:
         with httpx.Client(timeout=20, follow_redirects=False) as client:
-            response = client.get(f"{row['base_url']}/v2/stocks/{instrument}/bars", headers=headers, params={"timeframe": mapping[timeframe], "limit": limit, "adjustment": "all", "feed": row["feed"], "sort": "desc"})
+            response = client.get(f"{row['base_url']}/v2/stocks/{instrument}/bars", headers=headers, params={"timeframe": mapping[timeframe], "start": (utcnow() - timedelta(days=400)).isoformat(), "end": utcnow().isoformat(), "limit": limit, "adjustment": "all", "feed": row["feed"], "sort": "desc"})
         response.raise_for_status()
         payload = response.json()
         page = payload.get("bars") or []
@@ -1120,6 +1120,8 @@ def process_due_sessions() -> int:
 
 
 def append_live_log(logs: list[dict[str, Any]], level: str, message: str) -> list[dict[str, Any]]:
+    if logs and logs[-1].get("level") == level and logs[-1].get("message") == message:
+        return logs[-200:]
     return (logs + [{"at": iso(), "level": level, "message": message}])[-200:]
 
 
