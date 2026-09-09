@@ -273,7 +273,7 @@ class SessionConfig(BaseModel):
     maximum_duration_minutes: int = Field(default=180, ge=15, le=10080)
     token_budget: int = Field(default=20000, ge=1000, le=10_000_000)
     maximum_repair_attempts: int = Field(default=2, ge=0, le=5)
-    generation_interval_minutes: int = Field(default=15, ge=15, le=1440)
+    generation_interval_minutes: int = Field(default=0, ge=0, le=1440)
     generate_immediately: bool = True
     web_research_enabled: bool = False
     web_research_query: str | None = Field(default=None, max_length=300)
@@ -1442,15 +1442,16 @@ def process_live_tests() -> int:
 
 async def scheduler(stop: asyncio.Event) -> None:
     while not stop.is_set():
+        processed = 0
         try:
-            process_due_sessions()
-            process_watchlist()
-            process_live_tests()
-            process_paper_automation()
+            processed = await asyncio.to_thread(process_due_sessions)
+            await asyncio.to_thread(process_watchlist)
+            await asyncio.to_thread(process_live_tests)
+            await asyncio.to_thread(process_paper_automation)
         except Exception:
             pass
         try:
-            await asyncio.wait_for(stop.wait(), timeout=5)
+            await asyncio.wait_for(stop.wait(), timeout=0 if processed else 5)
         except TimeoutError:
             pass
 

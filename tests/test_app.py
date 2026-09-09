@@ -382,6 +382,27 @@ def test_session_immediate_generation_and_frozen_config():
     assert datetime.fromisoformat(started["next_run_at"]) > datetime.now(UTC)
 
 
+def test_continuous_generation_runs_one_candidate_per_cycle():
+    created = client.post("/api/research-sessions", json=session_config(generation_interval_minutes=0, maximum_candidates=3)).json()
+    started = client.post(f"/api/research-sessions/{created['id']}/start").json()
+    assert started["generation_count"] == 1
+    service.process_due_sessions()
+    second = client.get(f"/api/research-sessions/{created['id']}").json()
+    assert second["generation_count"] == 2 and second["in_flight"] == 0
+    service.process_due_sessions()
+    third = client.get(f"/api/research-sessions/{created['id']}").json()
+    assert third["generation_count"] == 3
+    service.process_due_sessions()
+    finished = client.get(f"/api/research-sessions/{created['id']}").json()
+    assert finished["state"] == "COMPLETED"
+
+
+def test_sub_fifteen_minute_intervals_are_valid():
+    for interval in (1, 5, 10):
+        result = client.post("/api/research-sessions", json=session_config(generation_interval_minutes=interval))
+        assert result.status_code == 200
+
+
 def test_pause_resume_and_no_missed_tick_burst():
     created = client.post("/api/research-sessions", json=session_config()).json()
     started = client.post(f"/api/research-sessions/{created['id']}/start").json()

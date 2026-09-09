@@ -1,6 +1,6 @@
 # Strategy Lab
 
-Responsive strategy-research software: persistent 15-minute sessions, configurable instruments and 1m/5m/15m/1h/1d timeframes, configurable OpenAI-compatible providers, reviewed Python strategy templates, deterministic chronological batch backtests, leaderboard/comparison, immutable live-data-test setup, audit history, fail-closed trading screens.
+Responsive strategy-research software: persistent sequential research sessions, configurable instruments and 1m/5m/15m/1h/1d timeframes, configurable OpenAI-compatible providers, reviewed Python strategy templates, deterministic chronological batch backtests, leaderboard/comparison, immutable live-data-test setup, audit history, fail-closed trading screens.
 
 > **No profit promise. Not investment advice.** Backtests and simulations do not predict future returns. Execution can differ materially. Risk thresholds are not guaranteed loss caps.
 
@@ -65,7 +65,7 @@ Open <http://localhost:8000>. Health: <http://localhost:8000/api/health>. Readin
 1. Open **Settings → Alpaca connections**, save Market Data credentials, select the entitled feed, then test it.
 2. Optionally save server-side AI provider settings. Test connection. API keys return masked only.
 3. Open **Research Sessions → New research session**. Choose a suggested prompt, use the guided prompt builder, or write complete Advanced instructions. Custom prompts cannot bypass reviewed-template, validation, security, or risk restrictions.
-4. Keep default 15-minute interval. Set candidate/time/token ceilings.
+4. Keep default Continuous interval to start each candidate after the previous finishes, or select 1/5/10/15/30/60 minutes. Set candidate/time/token ceilings.
 5. Start. SQLite persistence plus the backend scheduler continue after browser closure.
 6. Pause/resume, or choose **Stop & backtest all**.
 7. Review all attempts—including duplicates/invalid output—and backtest outcomes.
@@ -127,7 +127,7 @@ pytest -q
 cd frontend && npm run build
 ```
 
-Tests cover fail-closed orders, encrypted/masked secrets, SSRF blocks, local allowlist, unsafe headers, immediate generation, 15-minute schedule, pause/resume, no missed-tick burst, stop/finalize, duplicates, chronological fill timing, immutable forward snapshot, fresh account, delayed-data validation, cancellation retention, audit chaining.
+Tests cover fail-closed orders, encrypted/masked secrets, SSRF blocks, local allowlist, unsafe headers, immediate sequential generation, configurable schedules, pause/resume, no missed-tick burst, stop/finalize, duplicates, chronological fill timing, immutable forward snapshot, fresh account, delayed-data validation, cancellation retention, audit chaining.
 
 All broker tests are absence/fake-boundary tests. No real order is submitted.
 
