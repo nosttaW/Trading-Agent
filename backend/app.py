@@ -27,6 +27,7 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from zoneinfo import ZoneInfo
 
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
@@ -776,6 +777,14 @@ def paper_session_public(row: sqlite3.Row) -> dict[str, Any]:
     return item
 
 
+def market_day() -> str:
+    return utcnow().astimezone(ZoneInfo("America/New_York")).date().isoformat()
+
+
+def broker_position(positions: list[dict[str, Any]], symbol: str) -> dict[str, Any] | None:
+    return next((position for position in positions if position.get("symbol") == symbol), None)
+
+
 def reconcile_paper(row: sqlite3.Row, broker: AlpacaPaperBroker) -> dict[str, Any]:
     account, positions, broker_orders = broker.account(), broker.positions(), broker.orders()
     if str(account.get("id")) != row["broker_account_id"]:
@@ -793,31 +802,45 @@ def reconcile_paper(row: sqlite3.Row, broker: AlpacaPaperBroker) -> dict[str, An
         open_orders = []
         for local in local_orders:
             broker_order = mapped.get(local["client_order_id"])
-            if not broker_order and local["status"] in {"PENDING_SUBMIT", "UNKNOWN"}:
+            if not broker_order and local["status"] in {"PENDING_SUBMIT", "UNKNOWN", "ACCEPTED", "NEW", "PENDING_NEW", "PARTIALLY_FILLED", "PENDING_CANCEL"}:
                 unresolved.append(local["client_order_id"])
                 continue
             if broker_order:
                 if str(broker_order.get("status", "")).lower() in active_statuses: open_orders.append(local["client_order_id"])
                 connection.execute("UPDATE paper_orders SET broker_order_id=?,status=?,filled_quantity=?,average_fill_price=?,raw_status=?,updated_at=? WHERE id=?", (broker_order.get("id"), str(broker_order.get("status", "unknown")).upper(), str(broker_order.get("filled_qty", "0")), broker_order.get("filled_avg_price"), canonical({key: broker_order.get(key) for key in ("status", "submitted_at", "filled_at", "canceled_at")}), iso(), local["id"]))
         equity = decimal_value(account.get("equity", "0"))
-        peak = max(decimal_value(row["peak_equity"] or "0"), equity)
+        strategy_state = json.loads(row["strategy_state"] or "{}")
+        day = market_day()
+        if strategy_state.get("risk_day") != day:
+            strategy_state["risk_day"] = day
+            start_equity, peak = equity, equity
+        else:
+            start_equity, peak = decimal_value(row["start_of_day_equity"] or str(equity)), max(decimal_value(row["peak_equity"] or "0"), equity)
         state = "HALTED" if unresolved else row["state"]
-        connection.execute("UPDATE paper_sessions SET last_reconciled_at=?,peak_equity=?,state=?,updated_at=? WHERE id=?", (iso(), str(peak), state, iso(), row["id"]))
+        connection.execute("UPDATE paper_sessions SET last_reconciled_at=?,peak_equity=?,start_of_day_equity=?,strategy_state=?,state=?,updated_at=? WHERE id=?", (iso(), str(peak), str(start_equity), canonical(strategy_state), state, iso(), row["id"]))
     return {"account": {"equity": account.get("equity"), "cash": account.get("cash"), "buying_power": account.get("buying_power"), "status": account.get("status")}, "positions": [{key: position.get(key) for key in ("symbol", "qty", "market_value", "avg_entry_price", "unrealized_pl")} for position in positions], "unresolved": unresolved, "open_orders": open_orders}
 
 
-def enforce_paper_risk(row: sqlite3.Row, value: PaperOrderInput, account: dict[str, Any]) -> None:
+def enforce_paper_risk(row: sqlite3.Row, value: PaperOrderInput, account: dict[str, Any], positions: list[dict[str, Any]]) -> None:
     if row["state"] != "ACTIVE" or row["emergency_stop"] or datetime.fromisoformat(row["approval_expires_at"]) <= utcnow():
         raise HTTPException(403, "Paper session is halted, stopped, or expired")
     if not row["last_reconciled_at"]:
         raise HTTPException(409, "Reconciliation required before submission")
     limits = json.loads(row["limits"])
-    notional = decimal_value(value.quantity, positive=True) * decimal_value(value.reference_price, positive=True)
-    if value.side == "buy":
+    quantity = decimal_value(value.quantity, positive=True)
+    reference = decimal_value(value.reference_price, positive=True)
+    notional = quantity * reference
+    position = broker_position(positions, row["instrument"])
+    held_quantity = decimal_value(position.get("qty", "0")) if position else Decimal("0")
+    if held_quantity < 0: raise HTTPException(409, "Risk gate: short broker position is unsupported")
+    if value.side == "sell":
+        if not position or quantity > held_quantity: raise HTTPException(422, "Risk gate: sell exceeds broker long position")
+    else:
         if notional > decimal_value(limits["max_order_notional"]):
             raise HTTPException(422, "Risk gate: order notional exceeds approval")
-        if notional > decimal_value(limits["max_position_notional"]):
-            raise HTTPException(422, "Risk gate: position exposure exceeds approval")
+        current_notional = abs(decimal_value(position.get("market_value", "0"))) if position else Decimal("0")
+        if current_notional + notional > decimal_value(limits["max_position_notional"]):
+            raise HTTPException(422, "Risk gate: resulting position exposure exceeds approval")
         if notional > decimal_value(account.get("buying_power", "0")):
             raise HTTPException(422, "Risk gate: insufficient broker buying power")
     equity = decimal_value(account.get("equity", "0"))
@@ -834,8 +857,8 @@ def enforce_paper_risk(row: sqlite3.Row, value: PaperOrderInput, account: dict[s
         raise HTTPException(409, "Unknown order outcome requires reconciliation")
 
 
-def persist_paper_order(row: sqlite3.Row, value: PaperOrderInput, broker: AlpacaPaperBroker, account: dict[str, Any]) -> dict[str, Any]:
-    enforce_paper_risk(row, value, account)
+def persist_paper_order(row: sqlite3.Row, value: PaperOrderInput, broker: AlpacaPaperBroker, account: dict[str, Any], positions: list[dict[str, Any]]) -> dict[str, Any]:
+    enforce_paper_risk(row, value, account, positions)
     dedupe = digest({"session": row["id"], "bar_at": value.bar_at.isoformat(), "side": value.side})[:24]
     client_order_id = f"sl-{dedupe}"
     order_id = str(uuid.uuid4())
@@ -1307,16 +1330,22 @@ def process_paper_automation() -> int:
                     quantity = decimal_value(positions[0]["qty"], positive=True); side = "sell"
                 if quantity > 0:
                     value = PaperOrderInput(side=side, quantity=str(quantity), reference_price=str(reference), bar_at=datetime.fromisoformat(latest["timestamp"].replace("Z", "+00:00")), confirmation="Submit Broker Paper Order")
-                    order = persist_paper_order(row, value, broker, reconciliation["account"])
+                    order = persist_paper_order(row, value, broker, reconciliation["account"], reconciliation["positions"])
                     logs = append_live_log(logs, "info", f"Autonomous {side} submitted for closed bar {latest['timestamp']}.")
             elif row["state"] != "ACTIVE" and not recovered: logs = append_live_log(logs, "info", "Automation waiting: paper session is paused.")
             elif target == current: logs = append_live_log(logs, "info", f"Closed bar evaluated; target remains {'long' if target else 'flat'}.")
             runtime["last_order"] = order["order"]["client_order_id"] if order else runtime.get("last_order")
             with connect() as connection: connection.execute("UPDATE paper_sessions SET state=CASE WHEN ? THEN 'ACTIVE' ELSE state END,last_bar_at=?,automation_state='RUNNING',automation_runtime=?,automation_logs=?,updated_at=? WHERE id=?", (int(recovered), latest["timestamp"], canonical(runtime), canonical(logs), iso(), row["id"]))
         except HTTPException as exc:
-            runtime["last_error"] = str(exc.detail); runtime["auto_paused"] = True; failures = int(runtime.get("consecutive_failures", 0)) + 1; runtime["consecutive_failures"] = failures
+            runtime["last_error"] = str(exc.detail); failures = int(runtime.get("consecutive_failures", 0)) + 1; runtime["consecutive_failures"] = failures
+            retryable = exc.status_code in {502, 503, 504} or (exc.status_code == 409 and str(exc.detail) in {"Unknown broker order; waiting for reconciliation", "Submitted paper order still open; waiting for settlement", "No fresh closed bar; waiting for market data"}) or str(exc.detail).startswith("Warm-up ")
+            runtime["auto_paused"] = retryable
             # ponytail: transient failures retry indefinitely while entries stay paused; add alert escalation when notification infrastructure exists.
-            with connect() as connection: connection.execute("UPDATE paper_sessions SET state='PAUSED',automation_state='RETRYING',automation_runtime=?,automation_logs=?,updated_at=? WHERE id=?", (canonical(runtime), canonical(append_live_log(logs, "error", f"Automation paused; retrying reconciliation/data: {exc.detail}")), iso(), initial["id"]))
+            with connect() as connection:
+                if retryable:
+                    connection.execute("UPDATE paper_sessions SET state='PAUSED',automation_state='RETRYING',automation_runtime=?,automation_logs=?,updated_at=? WHERE id=?", (canonical(runtime), canonical(append_live_log(logs, "error", f"Automation paused; retrying reconciliation/data: {exc.detail}")), iso(), initial["id"]))
+                else:
+                    connection.execute("UPDATE paper_sessions SET state='HALTED',emergency_stop=1,automation_enabled=0,automation_state='RISK_HALTED',automation_runtime=?,automation_logs=?,updated_at=? WHERE id=?", (canonical(runtime), canonical(append_live_log(logs, "error", f"Automation disabled by safety gate: {exc.detail}")), iso(), initial["id"]))
         processed += 1
     return processed
 
@@ -1828,6 +1857,9 @@ def create_paper_session(value: PaperApprovalInput):
     account = broker.account()
     if account.get("status") not in {"ACTIVE", "ACCOUNT_UPDATED"}:
         raise HTTPException(409, "Broker paper account is not active")
+    with connect() as connection:
+        conflict = connection.execute("SELECT id FROM paper_sessions WHERE broker_account_id=? AND instrument=? AND state!='STOPPED'", (str(account["id"]), instrument)).fetchone()
+    if conflict: raise HTTPException(409, "An existing non-stopped paper session already controls this instrument")
     session_id = str(uuid.uuid4())
     expires = utcnow() + timedelta(hours=value.expires_hours)
     equity_value = decimal_value(account.get("equity", "0"))
@@ -1875,7 +1907,7 @@ def control_paper_session(session_id: str, value: PaperControlInput):
         if value.confirmation != "EMERGENCY STOP PAPER":
             raise HTTPException(422, "Type exactly: EMERGENCY STOP PAPER")
         with connect() as connection:
-            connection.execute("UPDATE paper_sessions SET state='HALTED',emergency_stop=1,updated_at=? WHERE id=?", (iso(), session_id))
+            connection.execute("UPDATE paper_sessions SET state='HALTED',emergency_stop=1,automation_enabled=0,automation_state='EMERGENCY_STOPPED',updated_at=? WHERE id=?", (iso(), session_id))
         broker.cancel_all()
         audit("paper_session.emergency_stop", "paper_session", session_id, {"pending_order_policy": "cancel eligible; positions preserved"})
         return get_paper_session(session_id)
@@ -1896,7 +1928,7 @@ def control_paper_session(session_id: str, value: PaperControlInput):
         with connect() as connection: connection.execute("UPDATE paper_sessions SET state='PAUSED',automation_state=CASE WHEN automation_enabled=1 THEN 'PAUSED' ELSE automation_state END,automation_runtime=?,updated_at=? WHERE id=?", (canonical(runtime), iso(), session_id))
     elif value.action == "stop":
         if value.confirmation != "STOP BROKER PAPER": raise HTTPException(422, "Type exactly: STOP BROKER PAPER")
-        with connect() as connection: connection.execute("UPDATE paper_sessions SET state='STOPPED',emergency_stop=1,updated_at=? WHERE id=?", (iso(), session_id))
+        with connect() as connection: connection.execute("UPDATE paper_sessions SET state='STOPPED',emergency_stop=1,automation_enabled=0,automation_state='STOPPED',updated_at=? WHERE id=?", (iso(), session_id))
     audit(f"paper_session.{value.action}", "paper_session", session_id, {})
     return get_paper_session(session_id)
 
@@ -1930,13 +1962,17 @@ def submit_paper_order(session_id: str, value: PaperOrderInput):
     if not row:
         raise HTTPException(404, "Paper session not found")
     broker = paper_broker()
-    reconciliation = reconcile_paper(row, broker)
+    try: reconciliation = reconcile_paper(row, broker)
+    except HTTPException as exc:
+        with connect() as connection: connection.execute("UPDATE paper_sessions SET state='HALTED',emergency_stop=1,automation_enabled=0,automation_state='RECONCILIATION_FAILED',updated_at=? WHERE id=?", (iso(), session_id))
+        audit("paper_session.reconciliation_failed", "paper_session", session_id, {"error": str(exc.detail)})
+        raise
     with connect() as connection:
         row = connection.execute("SELECT * FROM paper_sessions WHERE id=?", (session_id,)).fetchone()
         dedupe = digest({"session": session_id, "bar_at": value.bar_at.isoformat(), "side": value.side})[:24]
         existing = connection.execute("SELECT * FROM paper_orders WHERE client_order_id=?", (f"sl-{dedupe}",)).fetchone()
     if existing: return {"order": dict(existing), "duplicate": True}
-    return persist_paper_order(row, value, broker, reconciliation["account"])
+    return persist_paper_order(row, value, broker, reconciliation["account"], reconciliation["positions"])
 
 
 @app.get("/api/activity")

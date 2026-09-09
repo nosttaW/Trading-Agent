@@ -257,6 +257,32 @@ def test_paper_automation_disable_and_emergency_stop_block_worker(monkeypatch):
     assert stopped.json()["state"] == "HALTED" and fake.submissions == []
 
 
+def test_paper_sell_cannot_exceed_broker_position(monkeypatch):
+    approved, fake = paper_ready(monkeypatch)
+    fake.positions = lambda: [{"symbol": "SPY", "qty": "1", "market_value": "100", "avg_entry_price": "100", "unrealized_pl": "0"}]
+    client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})
+    payload = {"side": "sell", "quantity": "2", "reference_price": "100", "bar_at": "2026-01-02T15:00:00Z", "confirmation": "Submit Broker Paper Order"}
+    result = client.post(f"/api/paper-sessions/{approved['id']}/orders", json=payload)
+    assert result.status_code == 422 and fake.submissions == []
+
+
+def test_paper_buy_checks_resulting_position_exposure(monkeypatch):
+    approved, fake = paper_ready(monkeypatch)
+    fake.positions = lambda: [{"symbol": "SPY", "qty": "22", "market_value": "2200", "avg_entry_price": "100", "unrealized_pl": "0"}]
+    client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})
+    payload = {"side": "buy", "quantity": "1", "reference_price": "100", "bar_at": "2026-01-02T15:00:00Z", "confirmation": "Submit Broker Paper Order"}
+    result = client.post(f"/api/paper-sessions/{approved['id']}/orders", json=payload)
+    assert result.status_code == 422 and fake.submissions == []
+
+
+def test_emergency_stop_disables_automation(monkeypatch):
+    approved, fake = paper_ready(monkeypatch)
+    client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})
+    enable_automation(approved)
+    stopped = client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "emergency_stop", "confirmation": "EMERGENCY STOP PAPER"}).json()
+    assert stopped["automation_enabled"] == 0 and stopped["automation_state"] == "EMERGENCY_STOPPED"
+
+
 def test_paper_risk_gate_and_emergency_stop(monkeypatch):
     approved, fake = paper_ready(monkeypatch)
     client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})
