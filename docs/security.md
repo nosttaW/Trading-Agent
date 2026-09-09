@@ -21,9 +21,9 @@
 
 No suitable hostile-code sandbox is deployed. Ordinary containers and AST/import checks are not treated as sufficient. Arbitrary AI/uploaded Python execution remains disabled. A future implementation needs microVM/gVisor-class isolation, no network/credentials/host FS, read-only root, non-root user, seccomp, process/CPU/memory/output/time limits, fixed dependencies, per-strategy failure isolation, and escape testing.
 
-### Broker paper/live
+### Live trading
 
-No Alpaca credentials, account calls, orders, cancel, replacement, streaming, or reconciliation exist. Broker paper cannot substitute for app simulation. Live cannot substitute for paper. Before implementation:
+Alpaca paper credentials, account checks, bounded market orders, cancellation, idempotency, and reconciliation are implemented only against `https://paper-api.alpaca.markets`. Live submission remains absent. Broker paper cannot substitute for app simulation. Live cannot substitute for paper. Before live implementation:
 
 - authentication and ownership;
 - secure sessions, CSRF, stronger live reauthentication;

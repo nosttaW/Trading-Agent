@@ -11,7 +11,7 @@ Responsive strategy-research software: persistent 15-minute sessions, configurab
 | Demo | Working. Deterministic sample bars; explicitly labeled. |
 | Historical backtest | Working for reviewed long-only US-equity templates on 1m/5m/15m/1h/1d deterministic demo bars. Demo data is synthetic—not symbol-specific market history. |
 | Live Data Test | Persistent immutable session/setup works; awaits configured current Alpaca data; never invents ticks/fills. |
-| Broker Paper | Disabled pending authenticated adapter and reconciliation. |
+| Broker Paper | Working through Alpaca's official paper endpoint after encrypted credentials, connection test, immutable approval, reconciliation, explicit resume, and independent risk checks. |
 | Live Trading | Disabled. No broker-order submission implementation exists. |
 | Arbitrary Python | Disabled. Source view/download works; trusted host executes reviewed templates only. |
 
@@ -92,6 +92,8 @@ Open **Settings → Alpaca connections**. Credentials can be added separately fo
 - Live: `https://api.alpaca.markets`; storage remains disabled unless the server live flag is enabled. Orders remain absent regardless.
 
 Key IDs and secret keys are encrypted server-side with `APP_ENCRYPTION_KEY`; browser receives masked placeholders only. Connection tests call latest AAPL data or account status. Errors redact credentials. No mode fallback. Obtain keys from <https://app.alpaca.markets/>; select Paper Trading before creating paper keys.
+
+Paper approval binds completed backtest, strategy/engine hashes, broker account, symbol, timeframe, allocation, order/position/loss/drawdown/frequency limits, and an expiry of at most seven days. New sessions start `HALTED`; reconciliation plus exact typed resume is required. Every intent persists before submission with deterministic client ID. Unknown outcomes block retries until reconciliation. Partial fill fields persist. Emergency Stop blocks entries, attempts cancellation of eligible pending paper orders, preserves positions, never liquidates automatically. The compact release exposes no automatic strategy-to-order scheduler; paper orders require the protected API and exact confirmation. This avoids unattended submission before market-data event ingestion and recovery are complete.
 
 ## Provider behavior
 

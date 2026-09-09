@@ -284,6 +284,50 @@ class LiveControlInput(BaseModel):
     action: Literal["pause_entries", "resume", "stop"]
 
 
+class PaperApprovalInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    backtest_id: str
+    capital_allocation: str = "1000.00"
+    max_order_notional: str = "250.00"
+    max_position_notional: str = "1000.00"
+    max_daily_loss: str = "100.00"
+    max_drawdown_percent: str = "10.00"
+    max_orders_per_hour: int = Field(default=4, ge=1, le=60)
+    expires_hours: int = Field(default=24, ge=1, le=168)
+    typed_approval: str
+
+    @model_validator(mode="after")
+    def limits(self):
+        values = [decimal_value(getattr(self, field), positive=True) for field in ("capital_allocation", "max_order_notional", "max_position_notional", "max_daily_loss", "max_drawdown_percent")]
+        if values[1] > values[0] or values[2] > values[0]:
+            raise ValueError("order and position limits cannot exceed capital allocation")
+        return self
+
+
+class PaperControlInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    action: Literal["reconcile", "pause", "resume", "stop", "emergency_stop"]
+    confirmation: str | None = Field(default=None, max_length=100)
+
+
+class PaperOrderInput(BaseModel):
+    """Manual reviewed intent for paper mode only. Strategies use the same risk path."""
+    model_config = ConfigDict(extra="forbid")
+    side: Literal["buy", "sell"]
+    quantity: str
+    reference_price: str
+    bar_at: datetime
+    confirmation: Literal["Submit Broker Paper Order"]
+
+    @model_validator(mode="after")
+    def positive_values(self):
+        decimal_value(self.quantity, positive=True)
+        decimal_value(self.reference_price, positive=True)
+        if self.bar_at.tzinfo is None:
+            raise ValueError("bar_at must include timezone")
+        return self
+
+
 def password_hash(password: str, salt: bytes | None = None, iterations: int = 600_000) -> str:
     """PBKDF2-HMAC-SHA256 encoded for ADMIN_PASSWORD_HASH."""
     salt = salt or secrets.token_bytes(16)
@@ -493,6 +537,139 @@ def test_alpaca(row: sqlite3.Row) -> dict[str, Any]:
         raise HTTPException(504, "Alpaca timed out or could not be reached")
     except (ValueError, json.JSONDecodeError):
         raise HTTPException(502, "Alpaca returned malformed JSON")
+
+
+class AlpacaPaperBroker:
+    """Official paper endpoint only. Never accepts a mode or live URL from callers."""
+    BASE_URL = "https://paper-api.alpaca.markets"
+
+    def __init__(self, row: sqlite3.Row):
+        if row["mode"] != "paper" or row["base_url"] != self.BASE_URL:
+            raise HTTPException(503, "Exact broker-paper connection required")
+        self.headers = {"APCA-API-KEY-ID": decrypt_secret(row["encrypted_key_id"]), "APCA-API-SECRET-KEY": decrypt_secret(row["encrypted_secret_key"]), "content-type": "application/json"}
+
+    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        try:
+            with httpx.Client(timeout=15, follow_redirects=False) as client:
+                response = client.request(method, f"{self.BASE_URL}{path}", headers=self.headers, json=body)
+            if 300 <= response.status_code < 400:
+                raise HTTPException(502, "Broker redirect rejected")
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError
+            return payload
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if status in {401, 403}:
+                raise HTTPException(502, "Alpaca paper authentication or account permission failed")
+            if status == 422:
+                raise HTTPException(422, "Alpaca paper rejected the validated order")
+            if status == 429:
+                raise HTTPException(503, "Alpaca paper rate limit reached")
+            raise HTTPException(502, f"Alpaca paper returned HTTP {status}")
+        except (httpx.TimeoutException, httpx.NetworkError):
+            raise HTTPException(504, "Unknown broker outcome; reconcile before retry")
+        except (ValueError, json.JSONDecodeError):
+            raise HTTPException(502, "Alpaca paper returned malformed JSON")
+
+    def account(self) -> dict[str, Any]: return self.request("GET", "/v2/account")
+    def list_request(self, path: str) -> list[dict[str, Any]]:
+        try:
+            with httpx.Client(timeout=15, follow_redirects=False) as client:
+                response = client.get(f"{self.BASE_URL}{path}", headers=self.headers)
+            if 300 <= response.status_code < 400:
+                raise HTTPException(502, "Broker redirect rejected")
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise ValueError
+            return payload
+        except httpx.HTTPStatusError as exc:
+            raise HTTPException(502, f"Alpaca paper returned HTTP {exc.response.status_code}")
+        except (httpx.TimeoutException, httpx.NetworkError):
+            raise HTTPException(504, "Broker reconciliation unavailable; execution remains halted")
+        except (ValueError, json.JSONDecodeError):
+            raise HTTPException(502, "Alpaca paper returned malformed JSON")
+    def positions(self) -> list[dict[str, Any]]: return self.list_request("/v2/positions")
+    def orders(self) -> list[dict[str, Any]]: return self.list_request("/v2/orders?status=all&limit=100&direction=desc")
+    def submit(self, symbol: str, side: str, quantity: str, client_order_id: str) -> dict[str, Any]:
+        return self.request("POST", "/v2/orders", {"symbol": symbol, "qty": quantity, "side": side, "type": "market", "time_in_force": "day", "client_order_id": client_order_id})
+    def cancel_all(self) -> None:
+        try:
+            with httpx.Client(timeout=15, follow_redirects=False) as client:
+                response = client.delete(f"{self.BASE_URL}/v2/orders", headers=self.headers)
+            if response.status_code not in {200, 204, 207}:
+                response.raise_for_status()
+        except (httpx.TimeoutException, httpx.NetworkError):
+            raise HTTPException(504, "Unknown cancel outcome; reconcile immediately")
+
+
+def paper_broker() -> AlpacaPaperBroker:
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM alpaca_connections WHERE mode='paper' AND last_test_status='CONNECTED'").fetchone()
+    if not row:
+        raise HTTPException(503, "Test a broker-paper connection first")
+    return AlpacaPaperBroker(row)
+
+
+def paper_session_public(row: sqlite3.Row) -> dict[str, Any]:
+    item = json_row(row, ("limits", "strategy_state"))
+    with connect() as connection:
+        orders = connection.execute("SELECT * FROM paper_orders WHERE paper_session_id=? ORDER BY created_at DESC LIMIT 100", (row["id"],)).fetchall()
+    item["orders"] = [dict(order) for order in orders]
+    item["mode"] = "BROKER_PAPER"
+    item["approval_active"] = datetime.fromisoformat(row["approval_expires_at"]) > utcnow()
+    return item
+
+
+def reconcile_paper(row: sqlite3.Row, broker: AlpacaPaperBroker) -> dict[str, Any]:
+    account, positions, broker_orders = broker.account(), broker.positions(), broker.orders()
+    if str(account.get("id")) != row["broker_account_id"]:
+        raise HTTPException(409, "Broker account identity mismatch")
+    mapped = {str(order.get("client_order_id")): order for order in broker_orders if order.get("client_order_id")}
+    with connect() as connection:
+        local_orders = connection.execute("SELECT * FROM paper_orders WHERE paper_session_id=?", (row["id"],)).fetchall()
+        unresolved = []
+        for local in local_orders:
+            broker_order = mapped.get(local["client_order_id"])
+            if not broker_order and local["status"] in {"PENDING_SUBMIT", "UNKNOWN"}:
+                unresolved.append(local["client_order_id"])
+                continue
+            if broker_order:
+                connection.execute("UPDATE paper_orders SET broker_order_id=?,status=?,filled_quantity=?,average_fill_price=?,raw_status=?,updated_at=? WHERE id=?", (broker_order.get("id"), str(broker_order.get("status", "unknown")).upper(), str(broker_order.get("filled_qty", "0")), broker_order.get("filled_avg_price"), canonical({key: broker_order.get(key) for key in ("status", "submitted_at", "filled_at", "canceled_at")}), iso(), local["id"]))
+        equity = decimal_value(account.get("equity", "0"))
+        peak = max(decimal_value(row["peak_equity"] or "0"), equity)
+        state = "HALTED" if unresolved else row["state"]
+        connection.execute("UPDATE paper_sessions SET last_reconciled_at=?,peak_equity=?,state=?,updated_at=? WHERE id=?", (iso(), str(peak), state, iso(), row["id"]))
+    return {"account": {"equity": account.get("equity"), "cash": account.get("cash"), "buying_power": account.get("buying_power"), "status": account.get("status")}, "positions": [{key: position.get(key) for key in ("symbol", "qty", "market_value", "avg_entry_price", "unrealized_pl")} for position in positions], "unresolved": unresolved}
+
+
+def enforce_paper_risk(row: sqlite3.Row, value: PaperOrderInput, account: dict[str, Any]) -> None:
+    if row["state"] != "ACTIVE" or row["emergency_stop"] or datetime.fromisoformat(row["approval_expires_at"]) <= utcnow():
+        raise HTTPException(403, "Paper session is halted, stopped, or expired")
+    if not row["last_reconciled_at"]:
+        raise HTTPException(409, "Reconciliation required before submission")
+    limits = json.loads(row["limits"])
+    notional = decimal_value(value.quantity, positive=True) * decimal_value(value.reference_price, positive=True)
+    if notional > decimal_value(limits["max_order_notional"]):
+        raise HTTPException(422, "Risk gate: order notional exceeds approval")
+    if value.side == "buy" and notional > decimal_value(limits["max_position_notional"]):
+        raise HTTPException(422, "Risk gate: position exposure exceeds approval")
+    if notional > decimal_value(account.get("buying_power", "0")):
+        raise HTTPException(422, "Risk gate: insufficient broker buying power")
+    equity = decimal_value(account.get("equity", "0"))
+    daily_loss = decimal_value(row["start_of_day_equity"] or str(equity)) - equity
+    drawdown = (decimal_value(row["peak_equity"] or str(equity)) - equity) / max(decimal_value(row["peak_equity"] or str(equity)), Decimal("0.01")) * 100
+    if daily_loss > decimal_value(limits["max_daily_loss"]) or drawdown > decimal_value(limits["max_drawdown_percent"]):
+        raise HTTPException(403, "Risk gate: loss or drawdown threshold breached")
+    with connect() as connection:
+        recent = connection.execute("SELECT COUNT(*) FROM paper_orders WHERE paper_session_id=? AND created_at>?", (row["id"], (utcnow() - timedelta(hours=1)).isoformat())).fetchone()[0]
+        unresolved = connection.execute("SELECT COUNT(*) FROM paper_orders WHERE paper_session_id=? AND status IN ('PENDING_SUBMIT','UNKNOWN')", (row["id"],)).fetchone()[0]
+    if recent >= limits["max_orders_per_hour"]:
+        raise HTTPException(429, "Risk gate: hourly order-frequency limit reached")
+    if unresolved:
+        raise HTTPException(409, "Unknown order outcome requires reconciliation")
 
 
 def provider_generate(row: sqlite3.Row, instructions: str, families: list[str]) -> tuple[dict[str, Any], int | None]:
@@ -1163,6 +1340,116 @@ def control_live_test(live_id: str, value: LiveControlInput):
             connection.execute("UPDATE live_tests SET state='STOPPED',paused_entries=1 WHERE id=?", (live_id,))
     audit(f"live_test.{value.action}", "live_test", live_id, {})
     return get_live_test(live_id)
+
+
+@app.get("/api/paper-sessions")
+def list_paper_sessions():
+    with connect() as connection:
+        rows = connection.execute("SELECT * FROM paper_sessions ORDER BY created_at DESC").fetchall()
+    return [paper_session_public(row) for row in rows]
+
+
+@app.post("/api/paper-sessions")
+def create_paper_session(value: PaperApprovalInput):
+    with connect() as connection:
+        backtest = connection.execute("SELECT b.*,c.source_hash FROM backtests b JOIN candidates c ON c.id=b.candidate_id WHERE b.id=? AND b.status='COMPLETED'", (value.backtest_id,)).fetchone()
+    if not backtest:
+        raise HTTPException(422, "Completed backtest required")
+    assumptions = json.loads(backtest["assumptions"])
+    instrument, timeframe = assumptions["instruments"][0], assumptions["timeframe"]
+    expected = f"APPROVE BROKER PAPER {instrument} {backtest['source_hash'][:12]}"
+    if value.typed_approval != expected:
+        raise HTTPException(422, f"Type exactly: {expected}")
+    broker = paper_broker()
+    account = broker.account()
+    if account.get("status") not in {"ACTIVE", "ACCOUNT_UPDATED"}:
+        raise HTTPException(409, "Broker paper account is not active")
+    session_id = str(uuid.uuid4())
+    expires = utcnow() + timedelta(hours=value.expires_hours)
+    limits = value.model_dump(mode="json", exclude={"backtest_id", "typed_approval", "expires_hours"})
+    equity = str(account.get("equity", "0"))
+    with connect() as connection:
+        connection.execute("INSERT INTO paper_sessions VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (session_id, backtest["id"], backtest["candidate_id"], backtest["source_hash"], ENGINE_HASH, str(account["id"]), instrument, timeframe, "HALTED", expires.isoformat(), canonical(limits), "{}", None, None, equity, equity, 1, None, None, iso(), iso()))
+    audit("paper_session.approved_halted", "paper_session", session_id, {"instrument": instrument, "strategy_hash": backtest["source_hash"], "expires_at": expires.isoformat()})
+    return get_paper_session(session_id)
+
+
+@app.get("/api/paper-sessions/{session_id}")
+def get_paper_session(session_id: str):
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM paper_sessions WHERE id=?", (session_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Paper session not found")
+    return paper_session_public(row)
+
+
+@app.post("/api/paper-sessions/{session_id}/control")
+def control_paper_session(session_id: str, value: PaperControlInput):
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM paper_sessions WHERE id=?", (session_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Paper session not found")
+    broker = paper_broker()
+    if value.action == "reconcile":
+        result = reconcile_paper(row, broker)
+        audit("paper_session.reconciled", "paper_session", session_id, {"unresolved": len(result["unresolved"])})
+        return {**get_paper_session(session_id), "broker": result}
+    if value.action == "emergency_stop":
+        if value.confirmation != "EMERGENCY STOP PAPER":
+            raise HTTPException(422, "Type exactly: EMERGENCY STOP PAPER")
+        with connect() as connection:
+            connection.execute("UPDATE paper_sessions SET state='HALTED',emergency_stop=1,updated_at=? WHERE id=?", (iso(), session_id))
+        broker.cancel_all()
+        audit("paper_session.emergency_stop", "paper_session", session_id, {"pending_order_policy": "cancel eligible; positions preserved"})
+        return get_paper_session(session_id)
+    if value.action == "resume":
+        if value.confirmation != "RESUME BROKER PAPER":
+            raise HTTPException(422, "Type exactly: RESUME BROKER PAPER")
+        reconciliation = reconcile_paper(row, broker)
+        if reconciliation["unresolved"] or datetime.fromisoformat(row["approval_expires_at"]) <= utcnow():
+            raise HTTPException(409, "Cannot resume: unresolved orders or expired approval")
+        with connect() as connection:
+            connection.execute("UPDATE paper_sessions SET state='ACTIVE',emergency_stop=0,updated_at=? WHERE id=?", (iso(), session_id))
+    elif value.action == "pause":
+        with connect() as connection: connection.execute("UPDATE paper_sessions SET state='PAUSED',updated_at=? WHERE id=?", (iso(), session_id))
+    elif value.action == "stop":
+        if value.confirmation != "STOP BROKER PAPER": raise HTTPException(422, "Type exactly: STOP BROKER PAPER")
+        with connect() as connection: connection.execute("UPDATE paper_sessions SET state='STOPPED',emergency_stop=1,updated_at=? WHERE id=?", (iso(), session_id))
+    audit(f"paper_session.{value.action}", "paper_session", session_id, {})
+    return get_paper_session(session_id)
+
+
+@app.post("/api/paper-sessions/{session_id}/orders")
+def submit_paper_order(session_id: str, value: PaperOrderInput):
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM paper_sessions WHERE id=?", (session_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Paper session not found")
+    broker = paper_broker()
+    reconciliation = reconcile_paper(row, broker)
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM paper_sessions WHERE id=?", (session_id,)).fetchone()
+    enforce_paper_risk(row, value, reconciliation["account"])
+    dedupe = digest({"session": session_id, "bar_at": value.bar_at.isoformat(), "side": value.side})[:24]
+    client_order_id = f"sl-{dedupe}"
+    order_id = str(uuid.uuid4())
+    with connect() as connection:
+        existing = connection.execute("SELECT * FROM paper_orders WHERE client_order_id=?", (client_order_id,)).fetchone()
+        if existing:
+            return {"order": dict(existing), "duplicate": True}
+        connection.execute("INSERT INTO paper_orders VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (order_id, session_id, client_order_id, None, value.bar_at.isoformat(), value.side, str(decimal_value(value.quantity, positive=True)), str(decimal_value(value.reference_price, positive=True)), "PENDING_SUBMIT", "0", None, None, None, iso(), iso()))
+    audit("paper_order.intent_persisted", "paper_order", order_id, {"session_id": session_id, "client_order_id": client_order_id, "side": value.side})
+    try:
+        submitted = broker.submit(row["instrument"], value.side, value.quantity, client_order_id)
+    except HTTPException as exc:
+        status = "UNKNOWN" if exc.status_code == 504 else "REJECTED"
+        with connect() as connection: connection.execute("UPDATE paper_orders SET status=?,error=?,updated_at=? WHERE id=?", (status, str(exc.detail), iso(), order_id))
+        raise
+    with connect() as connection:
+        connection.execute("UPDATE paper_orders SET broker_order_id=?,status=?,filled_quantity=?,average_fill_price=?,raw_status=?,updated_at=? WHERE id=?", (submitted.get("id"), str(submitted.get("status", "accepted")).upper(), str(submitted.get("filled_qty", "0")), submitted.get("filled_avg_price"), canonical({key: submitted.get(key) for key in ("status", "submitted_at", "filled_at")}), iso(), order_id))
+        final = connection.execute("SELECT * FROM paper_orders WHERE id=?", (order_id,)).fetchone()
+    audit("paper_order.submitted", "paper_order", order_id, {"client_order_id": client_order_id, "broker_order_id": submitted.get("id")})
+    return {"order": dict(final), "duplicate": False}
 
 
 @app.get("/api/activity")

@@ -150,6 +150,60 @@ def test_alpaca_feed_validation():
     assert client.post("/api/alpaca-connections", json={"mode": "paper", "label": "Paper", "key_id": "PAPERKEY1234", "secret_key": "PAPERSECRET1234", "feed": "sip"}).status_code == 422
 
 
+class FakePaperBroker:
+    def __init__(self): self.submissions = []; self.canceled = False
+    def account(self): return {"id": "paper-account-1", "status": "ACTIVE", "equity": "10000", "cash": "9000", "buying_power": "9000"}
+    def positions(self): return []
+    def orders(self): return [{"id": "broker-1", "client_order_id": order["client_order_id"], "status": "accepted", "filled_qty": "0", "filled_avg_price": None} for order in self.submissions]
+    def submit(self, symbol, side, quantity, client_order_id):
+        order = {"id": "broker-1", "client_order_id": client_order_id, "symbol": symbol, "side": side, "qty": quantity, "status": "accepted", "filled_qty": "0", "filled_avg_price": None}
+        self.submissions.append(order); return order
+    def cancel_all(self): self.canceled = True
+
+
+def paper_ready(monkeypatch):
+    completed = create_completed_session(); backtest = completed["backtests"][0]; fake = FakePaperBroker()
+    monkeypatch.setattr(service, "paper_broker", lambda: fake)
+    detail = client.get(f"/api/backtests/{backtest['id']}").json()
+    expected = f"APPROVE BROKER PAPER SPY {detail['source_hash'][:12]}"
+    approved = client.post("/api/paper-sessions", json={"backtest_id": backtest["id"], "typed_approval": expected}).json()
+    return approved, fake
+
+
+def test_paper_approval_starts_halted_and_binds_hash(monkeypatch):
+    approved, _ = paper_ready(monkeypatch)
+    assert approved["mode"] == "BROKER_PAPER"
+    assert approved["state"] == "HALTED" and approved["emergency_stop"] == 1
+    assert approved["strategy_hash"] and approved["engine_hash"] == service.ENGINE_HASH
+    assert approved["broker_account_id"] == "paper-account-1"
+
+
+def test_paper_resume_reconciles_and_order_is_idempotent(monkeypatch):
+    approved, fake = paper_ready(monkeypatch)
+    resumed = client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})
+    assert resumed.status_code == 200 and resumed.json()["state"] == "ACTIVE"
+    payload = {"side": "buy", "quantity": "1", "reference_price": "100", "bar_at": "2026-01-02T15:00:00Z", "confirmation": "Submit Broker Paper Order"}
+    first = client.post(f"/api/paper-sessions/{approved['id']}/orders", json=payload)
+    second = client.post(f"/api/paper-sessions/{approved['id']}/orders", json=payload)
+    assert first.status_code == second.status_code == 200
+    assert first.json()["duplicate"] is False and second.json()["duplicate"] is True
+    assert len(fake.submissions) == 1
+
+
+def test_paper_risk_gate_and_emergency_stop(monkeypatch):
+    approved, fake = paper_ready(monkeypatch)
+    client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "resume", "confirmation": "RESUME BROKER PAPER"})
+    excessive = {"side": "buy", "quantity": "3", "reference_price": "100", "bar_at": "2026-01-02T15:00:00Z", "confirmation": "Submit Broker Paper Order"}
+    assert client.post(f"/api/paper-sessions/{approved['id']}/orders", json=excessive).status_code == 422
+    stopped = client.post(f"/api/paper-sessions/{approved['id']}/control", json={"action": "emergency_stop", "confirmation": "EMERGENCY STOP PAPER"})
+    assert stopped.status_code == 200 and stopped.json()["state"] == "HALTED" and fake.canceled
+
+
+def test_live_order_route_stays_blocked_with_paper_features(monkeypatch):
+    paper_ready(monkeypatch)
+    assert client.post("/api/orders", json={"mode": "live"}).status_code == 403
+
+
 def test_session_immediate_generation_and_frozen_config():
     created = client.post("/api/research-sessions", json=session_config()).json()
     original_hash = created["config_hash"]

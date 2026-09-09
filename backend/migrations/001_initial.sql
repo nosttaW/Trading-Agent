@@ -136,6 +136,56 @@ CREATE TABLE IF NOT EXISTS jobs (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS paper_sessions (
+  id TEXT PRIMARY KEY,
+  backtest_id TEXT NOT NULL REFERENCES backtests(id),
+  candidate_id TEXT NOT NULL REFERENCES candidates(id),
+  strategy_hash TEXT NOT NULL,
+  engine_hash TEXT NOT NULL,
+  broker_account_id TEXT NOT NULL,
+  instrument TEXT NOT NULL,
+  timeframe TEXT NOT NULL,
+  state TEXT NOT NULL,
+  approval_expires_at TEXT NOT NULL,
+  limits TEXT NOT NULL,
+  strategy_state TEXT NOT NULL,
+  last_bar_at TEXT,
+  last_reconciled_at TEXT,
+  peak_equity TEXT,
+  start_of_day_equity TEXT,
+  emergency_stop INTEGER NOT NULL DEFAULT 0,
+  lease_owner TEXT,
+  lease_until TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS paper_orders (
+  id TEXT PRIMARY KEY,
+  paper_session_id TEXT NOT NULL REFERENCES paper_sessions(id),
+  client_order_id TEXT NOT NULL UNIQUE,
+  broker_order_id TEXT UNIQUE,
+  bar_at TEXT NOT NULL,
+  side TEXT NOT NULL CHECK(side IN ('buy','sell')),
+  quantity TEXT NOT NULL,
+  reference_price TEXT NOT NULL,
+  status TEXT NOT NULL,
+  filled_quantity TEXT NOT NULL DEFAULT '0',
+  average_fill_price TEXT,
+  raw_status TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS executor_control (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  emergency_stop INTEGER NOT NULL DEFAULT 1,
+  reason TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+INSERT OR IGNORE INTO executor_control(id,emergency_stop,reason,updated_at) VALUES(1,1,'Restart requires reconciliation',CURRENT_TIMESTAMP);
+
 CREATE TABLE IF NOT EXISTS approvals (
   id TEXT PRIMARY KEY,
   candidate_id TEXT NOT NULL REFERENCES candidates(id),
@@ -167,3 +217,5 @@ CREATE INDEX IF NOT EXISTS idx_candidates_session ON candidates(session_id,ordin
 CREATE INDEX IF NOT EXISTS idx_backtests_session ON backtests(session_id,status);
 CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(state,due_at);
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_events(at);
+CREATE INDEX IF NOT EXISTS idx_paper_sessions_state ON paper_sessions(state,approval_expires_at);
+CREATE INDEX IF NOT EXISTS idx_paper_orders_session ON paper_orders(paper_session_id,created_at);
