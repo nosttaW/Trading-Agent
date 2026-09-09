@@ -83,6 +83,14 @@ AI output is schema-validated. It may select one of three reviewed templates and
 
 Backtesting is a custom deterministic engine rather than a third-party library. Reason: required shared reviewed-template semantics, exact next-event timing, narrow initial scope, zero extra engine. Limit: not a general-purpose institutional simulator. Details: [`docs/strategy-interface.md`](docs/strategy-interface.md).
 
+## Watchlist and research sources
+
+Overview includes a persistent watchlist for up to 20 validated US-equity symbols. The server polls configured Alpaca bars, stores the latest 120 closes, and shows price, bar timestamp, polling heartbeat, timeframe, feed state, and sparkline. One-minute items poll at most every 15 seconds; slower intervals at most once per minute.
+
+Research Sessions optionally use constrained public web search for inspiration. Stored source records include URL, title, retrieval time, excerpt, and content hash. Search output is treated as untrusted data inside AI prompts; retrieved instructions cannot override platform rules. No downloaded code or serialized model executes. Search failure yields clearly model-generated hypotheses without invented citations. Search-result titles are discovery metadata—not verified claims or evidence of profitability.
+
+Historical and forward equity charts provide independent Buy/Sell marker filters. Markers represent recorded simulated fills only.
+
 ## Alpaca credentials
 
 Open **Settings → Alpaca connections**. Credentials can be added separately for:

@@ -39,6 +39,17 @@ CREATE TABLE IF NOT EXISTS alpaca_connections (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS watchlist (
+  symbol TEXT PRIMARY KEY,
+  timeframe TEXT NOT NULL,
+  bars TEXT NOT NULL DEFAULT '[]',
+  last_event_at TEXT,
+  last_poll_at TEXT,
+  status TEXT NOT NULL DEFAULT 'PENDING',
+  error TEXT,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS market_datasets (
   id TEXT PRIMARY KEY,
   provider TEXT NOT NULL,
@@ -50,6 +61,18 @@ CREATE TABLE IF NOT EXISTS market_datasets (
   bars TEXT NOT NULL,
   content_hash TEXT NOT NULL,
   created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS research_sources (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES research_sessions(id),
+  url TEXT NOT NULL,
+  title TEXT NOT NULL,
+  published_at TEXT,
+  retrieved_at TEXT NOT NULL,
+  excerpt TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  status TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS research_sessions (

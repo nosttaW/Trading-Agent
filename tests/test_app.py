@@ -224,6 +224,37 @@ def test_invalid_equity_symbol_is_rejected_before_session_creation(monkeypatch):
     assert "No US-equity data" in result.json()["detail"]
 
 
+def test_watchlist_persists_validated_live_bars(monkeypatch):
+    bars = service.demo_bars("1m")[-20:]
+    monkeypatch.setattr(service, "validate_alpaca_equity_symbol", lambda _: None)
+    monkeypatch.setattr(service, "latest_alpaca_bars", lambda *args: bars)
+    result = client.post("/api/watchlist", json={"symbol": "aapl", "timeframe": "1m"})
+    assert result.status_code == 200
+    item = result.json()[0]
+    assert item["symbol"] == "AAPL" and item["status"] == "CONNECTED"
+    assert len(item["bars"]) == 20 and item["last_poll_at"]
+    assert client.delete("/api/watchlist/AAPL").status_code == 200
+
+
+def test_web_research_sources_are_stored_with_provenance(monkeypatch):
+    source = {"url": "https://example.com/research", "title": "Example study", "published_at": "", "retrieved_at": service.iso(), "excerpt": "Search result title: Example study"}
+    monkeypatch.setattr(service, "web_search", lambda query, maximum: [source])
+    created = client.post("/api/research-sessions", json=session_config(web_research_enabled=True, web_research_query="robust trend research", web_research_max_sources=1))
+    assert created.status_code == 200
+    result = created.json()
+    assert result["research_sources"][0]["url"] == source["url"]
+    assert result["research_sources"][0]["content_hash"]
+
+
+def test_web_research_failure_never_fabricates_sources(monkeypatch):
+    def fail(*_): raise service.HTTPException(502, "search unavailable")
+    monkeypatch.setattr(service, "web_search", fail)
+    created = client.post("/api/research-sessions", json=session_config(web_research_enabled=True, web_research_query="robust trend research"))
+    assert created.status_code == 200
+    assert created.json()["research_sources"] == []
+    assert created.json()["last_error"] == "search unavailable"
+
+
 def test_session_immediate_generation_and_frozen_config():
     created = client.post("/api/research-sessions", json=session_config()).json()
     original_hash = created["config_hash"]
