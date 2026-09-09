@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "name": "tradingagentv01",
+  "environmentId": "0",
+  "projectId": "12ea0923-ccfb-4522-ad8f-ff75f4cb65e4",
+  "composeProject": "tradingagentv01",
+  "services": ["guardrail-trading"],
+  "containers": ["guardrail-trading"],
+  "image": "ghcr.io/nosttaw/trading-agent:latest",
+  "dashboard": "http://192.168.2.60:8200/",
+  "status": "http://192.168.2.60:8200/api/status",
+  "executionEnabled": false
+}

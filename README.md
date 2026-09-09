@@ -52,7 +52,7 @@ docker compose pull
 docker compose up -d
 ```
 
-Default package: `ghcr.io/nosttaw/trading-agent:latest`. Pin an immutable workflow build with `TRADING_AGENT_TAG=<commit-sha>` in `.env`. The package workflow tests, builds, then publishes `latest` plus the full commit SHA on `main`; pull requests build without publishing.
+Default package: `ghcr.io/nosttaw/trading-agent:latest`. Pin an immutable workflow build with `TRADING_AGENT_TAG=<commit-sha>` in `.env`. The package workflow tests, builds, then publishes `latest` plus the full commit SHA on `main`; pull requests build without publishing. Arcane deployment uses `docker-compose.arcane.yml`; editing repository Compose does not automatically redeploy an existing Arcane project.
 
 Open <http://localhost:8000>. Health: <http://localhost:8000/api/health>. Readiness: <http://localhost:8000/api/readiness>.
 
