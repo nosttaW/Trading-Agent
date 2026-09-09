@@ -1,10 +1,11 @@
 services:
   backend:
-    build: .
+    image: ghcr.io/nosttaw/trading-agent:${TRADING_AGENT_TAG:-latest}
+    pull_policy: always
     environment:
       TRADING_DB_PATH: /data/trading.db
       APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:?Set APP_ENCRYPTION_KEY in .env}
-      CORS_ORIGINS: http://localhost:5173
+      CORS_ORIGINS: http://localhost:8000
       AI_LOCAL_ENDPOINT_ALLOWLIST: ${AI_LOCAL_ENDPOINT_ALLOWLIST:-}
       ENABLE_LIVE_TRADING: "false"
     volumes:
@@ -20,15 +21,5 @@ services:
     pids_limit: 128
     mem_limit: 512m
     cpus: 1.0
-  frontend:
-    image: node:22-alpine
-    working_dir: /app
-    volumes:
-      - ./frontend:/app
-    ports:
-      - "5173:5173"
-    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0"
-    restart: unless-stopped
-
 volumes:
   strategy_lab_data:

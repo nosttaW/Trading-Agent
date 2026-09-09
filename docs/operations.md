@@ -10,7 +10,8 @@ cd Trading-Agent
 cp .env.example .env
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 # Store output as APP_ENCRYPTION_KEY in .env; chmod 600 .env
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 docker compose ps
 curl --fail http://127.0.0.1:8000/api/health
 curl --fail http://127.0.0.1:8000/api/readiness
@@ -77,9 +78,10 @@ Trading is disabled. Preserve the fail-closed state regardless.
 ```bash
 git fetch --all --tags
 git checkout <reviewed-commit>
-docker compose build
 pytest -q
 npm ci --prefix frontend && npm run build --prefix frontend
+# Set TRADING_AGENT_TAG=<reviewed-commit-sha> in .env.
+docker compose pull backend
 docker compose stop backend
 # Create backup above
 docker compose up -d
@@ -91,8 +93,10 @@ Rollback:
 ```bash
 docker compose down
 git checkout <previous-reviewed-commit>
+# Set TRADING_AGENT_TAG=<previous-full-commit-sha> in .env.
 # Restore pre-update DB if schema compatibility requires it.
-docker compose up -d --build
+docker compose pull backend
+docker compose up -d
 ```
 
 Never auto-update while any future execution mode is active. Future deployment must halt, cancel no protective exits, reconcile account/orders/positions/cash, reacquire lease, verify hashes/approval/data/risk, then require explicit resume.

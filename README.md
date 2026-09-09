@@ -43,16 +43,18 @@ rm -rf backend/static && cp -R dist backend/static
 python -m uvicorn --app-dir backend app:app --host 0.0.0.0 --port 8000
 ```
 
-Docker:
+Packaged Docker image:
 
 ```bash
 cp .env.example .env
-# Set APP_ENCRYPTION_KEY
-# Compose reads .env
-docker compose up --build
+# Set APP_ENCRYPTION_KEY. Compose pulls the GHCR package.
+docker compose pull
+docker compose up -d
 ```
 
-Open <http://localhost:5173>. Health: <http://localhost:8000/api/health>. Readiness: <http://localhost:8000/api/readiness>.
+Default package: `ghcr.io/nosttaw/trading-agent:latest`. Pin an immutable workflow build with `TRADING_AGENT_TAG=<commit-sha>` in `.env`. The package workflow tests, builds, then publishes `latest` plus the full commit SHA on `main`; pull requests build without publishing.
+
+Open <http://localhost:8000>. Health: <http://localhost:8000/api/health>. Readiness: <http://localhost:8000/api/readiness>.
 
 ## Beginner workflow
 
