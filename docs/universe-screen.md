@@ -36,9 +36,9 @@ Funnel counts are cumulative. Weekends and cross-session gaps, including Labor D
 
 ## Ranking
 
-Development: 2023-01-01..2025-12-31, three calendar-year thirds. Nine reviewed variants across moving average, RSI, channel breakout. Scores use the exact 30/20/15/10/10/10/5 components. Equal scores use Sortino, drawdown, trades, turnover, dollar volume, symbol. Raw gross return never reranks.
+Development uses every completed daily bar Alpaca returns from 1970-01-01 through 2025-12-31, bounded by the instrument's actual listing history. It divides those observations into three contiguous chronological blocks of nearly equal bar count. Nine reviewed variants span moving average, RSI, and channel breakout. Scores use the exact 30/20/15/10/10/10/5 components. Equal scores use Sortino, drawdown, trades, turnover, dollar volume, symbol. Raw gross return never reranks.
 
-Sensitivity uses each parameter +/-10% of its catalog range, maximum three parameters. Candidates below 15 development round trips reject. Forty trades saturates sample score. Concentration penalizes top-five winning trades >30% and best positive month >35%.
+Sensitivity uses each parameter +/-10% of its catalog range, maximum three parameters. Candidates below 15 development round trips reject. The system fetches maximum available history first; if every candidate still produces fewer than 15 completed round trips, it reports the maximum observed trade count, development dates, and bar count. It never manufactures trades or lowers the evidence floor. Forty trades saturates sample score. Concentration penalizes top-five winning trades >30% and best positive month >35%.
 
 Multiplicity records instruments × 9 candidates and Bonferroni alpha. The implementation does not claim a deflated Sharpe/PBO estimate. Raw Sharpe is descriptive only.
 

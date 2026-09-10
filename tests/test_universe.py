@@ -80,6 +80,14 @@ def test_funnel_boundary_price_and_liquidity():
     assert service.hard_screen(asset, bars)[1].startswith("C1")
 
 
+def test_development_uses_all_available_pre_cutoff_history():
+    bars = long_bars(); start = bars[0]["timestamp"][:10]; cutoff = bars[-10]["timestamp"][:10]
+    periods = service.development_periods(bars, cutoff)
+    assert periods[0][0] == start and periods[-1][1] == cutoff
+    sizes = [len([bar for bar in bars if left <= bar["timestamp"][:10] <= right]) for left, right in periods]
+    assert max(sizes) - min(sizes) <= 1
+
+
 def test_universe_run_dry_run_no_database_write(monkeypatch):
     monkeypatch.setattr(service, "alpaca_data_connection", lambda: {"feed": "sip"})
     before = client.get("/api/universe-runs").json()
@@ -91,12 +99,14 @@ def test_universe_run_dry_run_no_database_write(monkeypatch):
 def test_universe_empty_shortlist_conflict_is_byte_reproducible(monkeypatch):
     monkeypatch.setattr(service, "alpaca_data_connection", lambda: {"feed": "sip"})
     monkeypatch.setattr(service, "fetch_alpaca_assets", lambda **_: [verified_asset()])
-    monkeypatch.setattr(service, "fetch_alpaca_bars", lambda *_: (long_bars(), "sip"))
+    requested_starts = []
+    monkeypatch.setattr(service, "fetch_alpaca_bars", lambda _symbol, _timeframe, start, _end: (requested_starts.append(start) or long_bars(), "sip"))
     payload = {"feed": "sip", "symbols": ["TEST"], "maximum_instruments": 1, "seed": 42}
     created = client.post("/api/universe-runs", json=payload).json(); service.process_universe_jobs(); first = client.get(f"/api/universe-runs/{created['id']}").json()
     assert first["state"] == "COMPLETED" and first["result_json"]["symbols"] == []
     assert all(item["verdict"] == "unverified out-of-sample" for item in first["result_json"]["ranking"])
     assert "Research and simulation only" in first["result_ascii"]
+    assert requested_starts[0] == service.UNIVERSE_HISTORY_START
 
 
 def test_universe_pending_cancellation(monkeypatch):

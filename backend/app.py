@@ -1488,8 +1488,9 @@ def process_due_sessions() -> int:
     return processed
 
 
-UNIVERSE_ENGINE_VERSION = "universe-screen-1.0"
-UNIVERSE_ENGINE_HASH = hashlib.sha256(b"universe-screen-1.0|strict-metadata|development-rank-before-single-holdout|reviewed-nine|costed-next-open").hexdigest()
+UNIVERSE_ENGINE_VERSION = "universe-screen-1.1"
+UNIVERSE_HISTORY_START = "1970-01-01"
+UNIVERSE_ENGINE_HASH = hashlib.sha256(b"universe-screen-1.1|maximum-pre-holdout-history|chronological-thirds|strict-metadata|reviewed-nine|costed-next-open").hexdigest()
 UNIVERSE_FOOTER = "Research and simulation only. Not investment advice. No profit promise.\nBacktests and simulations do not predict future returns. Execution may differ materially."
 
 
@@ -1529,12 +1530,19 @@ def best_month_concentration(equity_curve: list[dict[str, Any]]) -> float | None
     return round(max(positive) / sum(positive) * 100, 2) if positive and sum(positive) else None
 
 
-def rank_candidate_evidence(family: str, params: dict[str, int], bars: list[dict[str, Any]], seed: int, dollar_volume: float) -> dict[str, Any]:
-    thirds = [("2023-01-01", "2023-12-31"), ("2024-01-01", "2024-12-31"), ("2025-01-01", "2025-12-31")]
+def development_periods(bars: list[dict[str, Any]], cutoff: str) -> list[tuple[str, str]]:
+    development = [bar for bar in bars if bar["timestamp"][:10] <= cutoff]
+    if len(development) < 500: raise ValueError("fewer than 500 completed development bars across full available history")
+    boundaries = [0, len(development) // 3, len(development) * 2 // 3, len(development)]
+    return [(development[boundaries[index]]["timestamp"][:10], development[boundaries[index + 1] - 1]["timestamp"][:10]) for index in range(3)]
+
+
+def rank_candidate_evidence(family: str, params: dict[str, int], bars: list[dict[str, Any]], seed: int, dollar_volume: float, cutoff: str = "2025-12-31") -> dict[str, Any]:
+    thirds = development_periods(bars, cutoff); development_start, development_end = thirds[0][0], thirds[-1][1]
     periods = [evaluate_universe_candidate(family, params, bars, start, end, seed, "base") for start, end in thirds]
     adverse = [evaluate_universe_candidate(family, params, bars, start, end, seed, "adverse") for start, end in thirds]
-    severe = evaluate_universe_candidate(family, params, bars, "2023-01-01", "2025-12-31", seed, "severe")
-    combined = evaluate_universe_candidate(family, params, bars, "2023-01-01", "2025-12-31", seed, "base")
+    severe = evaluate_universe_candidate(family, params, bars, development_start, development_end, seed, "severe")
+    combined = evaluate_universe_candidate(family, params, bars, development_start, development_end, seed, "base")
     returns = [item["metrics"]["net_return_percent"] for item in periods]; mean_return = statistics.mean(returns)
     degradation = statistics.mean(abs(value - mean_return) for value in returns) / max(1, abs(mean_return)); stability = clamp(1 - degradation)
     ratios = [value for item in periods + adverse for value in (item["metrics"]["sharpe"], item["metrics"]["sortino"]) if value is not None]; risk = clamp((statistics.mean(ratios) + 1) / 3) if ratios else 0
@@ -1542,13 +1550,13 @@ def rank_candidate_evidence(family: str, params: dict[str, int], bars: list[dict
     sample = (clamp(metrics["trade_count"] / 40) + clamp((metrics["exposure_percent"] or 0) / 30) + clamp(1 - metrics["turnover_percent"] / 10000)) / 3
     nearby = universe_perturbations(family, params); signs = []
     for changed in nearby:
-        result = evaluate_universe_candidate(family, changed, bars, "2023-01-01", "2025-12-31", seed, "base")
+        result = evaluate_universe_candidate(family, changed, bars, development_start, development_end, seed, "base")
         signs.append((result["metrics"]["net_return_percent"] >= 0) == (metrics["net_return_percent"] >= 0))
     top5, best_month = top_five_concentration(combined["trades"]), best_month_concentration(combined["equity_curve"])
     robustness = (sum(signs) / len(signs) if signs else 0) - (0.25 if top5 is not None and top5 > 30 else 0) - (0.25 if best_month is not None and best_month > 35 else 0)
     score_components = {"oos_stability": 30 * stability, "risk_adjusted": 20 * risk, "drawdown_quality": 15 * dd_quality, "sample_sufficiency": 10 * sample, "robustness": 10 * clamp(robustness), "cost_tolerance": 10 if severe["metrics"]["net_return_percent"] > 0 else 0, "execution_realism": 5 if dollar_volume >= 20_000_000 else 0}
     beats = sum(period["metrics"]["net_return_percent"] > period["metrics"]["benchmark_return_percent"] for period in periods)
-    return {"family": family, "parameters": params, "parameter_bounds": parameter_bounds(family), "score": round(sum(score_components.values()), 2), "score_components": {key: round(value, 2) for key, value in score_components.items()}, "development": combined, "thirds": periods, "adverse_thirds": adverse, "severe": severe, "sensitivity_sign_share_percent": round(sum(signs) / len(signs) * 100, 2) if signs else None, "top5_concentration_percent": top5, "best_month_percent": best_month, "beats_buy_hold_thirds": beats}
+    return {"family": family, "parameters": params, "parameter_bounds": parameter_bounds(family), "development_period": {"start": development_start, "end": development_end, "bars": len([bar for bar in bars if development_start <= bar["timestamp"][:10] <= development_end]), "thirds": thirds}, "score": round(sum(score_components.values()), 2), "score_components": {key: round(value, 2) for key, value in score_components.items()}, "development": combined, "thirds": periods, "adverse_thirds": adverse, "severe": severe, "sensitivity_sign_share_percent": round(sum(signs) / len(signs) * 100, 2) if signs else None, "top5_concentration_percent": top5, "best_month_percent": best_month, "beats_buy_hold_thirds": beats}
 
 
 def hard_screen(asset: dict[str, Any], bars: list[dict[str, Any]]) -> tuple[bool, str | None, dict[str, Any]]:
@@ -1562,7 +1570,7 @@ def hard_screen(asset: dict[str, Any], bars: list[dict[str, Any]]) -> tuple[bool
     facts = {"last_price_usd": round(price, 2), "median_daily_volume_shares": round(med_volume), "median_daily_dollar_volume_usd": round(med_dollar, 2)}
     if med_volume < 500_000 or med_dollar < 20_000_000: return False, "C2 liquidity threshold failed", facts
     if len(completed) < 750: return False, "C3 listing age below 750 completed bars", facts
-    development = [bar for bar in completed if "2023-01-01" <= bar["timestamp"][:10] <= "2025-12-31"]
+    development = [bar for bar in completed if bar["timestamp"][:10] <= "2025-12-31"]
     if len(development) < 500: return False, "C4 development history below 500 completed bars", facts
     if not asset.get("tradable") or asset.get("status") != "active": return False, "C5 not tradable/active", facts
     if not re.fullmatch(r"[A-Z]+", asset["symbol"]): return False, "C6 ticker resolution failed", facts
@@ -1616,12 +1624,12 @@ def process_universe_run(run_id: str) -> None:
             symbol = asset["symbol"]
             try:
                 if spec["offline"]:
-                    with connect() as connection: cached = connection.execute("SELECT * FROM market_datasets WHERE instrument=? AND timeframe='1d' AND start_at<=? AND end_at>=? ORDER BY created_at DESC LIMIT 1", (symbol, "2022-01-01", "2026-09-09")).fetchone()
+                    with connect() as connection: cached = connection.execute("SELECT * FROM market_datasets WHERE instrument=? AND timeframe='1d' AND end_at>=? ORDER BY start_at,created_at DESC LIMIT 1", (symbol, "2026-09-09")).fetchone()
                     if not cached: raise HTTPException(422, "offline daily cache unavailable")
                     bars, feed, dataset_id = json.loads(cached["bars"]), cached["feed"], cached["id"]
                 else:
-                    bars, feed = fetch_alpaca_bars(symbol, "1d", "2022-01-01", "2026-09-09"); dataset_id = f"UNIVERSE-{symbol}-{digest(bars)[:16]}"
-                    with connect() as connection: connection.execute("INSERT OR IGNORE INTO market_datasets VALUES(?,?,?,?,?,?,?,?,?,?)", (dataset_id, "alpaca", symbol, "1d", "2022-01-01", "2026-09-09", feed, canonical(bars), digest(bars), iso()))
+                    bars, feed = fetch_alpaca_bars(symbol, "1d", UNIVERSE_HISTORY_START, "2026-09-09"); dataset_id = f"UNIVERSE-{symbol}-{digest(bars)[:16]}"
+                    with connect() as connection: connection.execute("INSERT OR IGNORE INTO market_datasets VALUES(?,?,?,?,?,?,?,?,?,?)", (dataset_id, "alpaca", symbol, "1d", bars[0]["timestamp"][:10], "2026-09-09", feed, canonical(bars), digest(bars), iso()))
                 if feed != spec["feed"]: raise HTTPException(422, f"configured/frozen feed {feed} does not match requested {spec['feed']}")
                 bars = completed_bars(bars, "1d", datetime(2026,9,10,0,0,tzinfo=ZoneInfo("America/New_York")))
                 passed, reason, facts = hard_screen(asset, bars)
@@ -1631,9 +1639,12 @@ def process_universe_run(run_id: str) -> None:
                 dev_bars = [bar for bar in bars if bar["timestamp"][:10] <= spec["cutoff"]]
                 evidence = []
                 for family in ("moving_average", "rsi", "channel_breakout"):
-                    for params in TEMPLATES[family]["variants"]: evidence.append(rank_candidate_evidence(family, params, dev_bars, spec["seed"], facts["median_daily_dollar_volume_usd"]))
+                    for params in TEMPLATES[family]["variants"]: evidence.append(rank_candidate_evidence(family, params, dev_bars, spec["seed"], facts["median_daily_dollar_volume_usd"], spec["cutoff"]))
                 eligible = [item for item in evidence if item["development"]["metrics"]["trade_count"] >= 15]
-                if not eligible: insufficient.append({"symbol": symbol, "reason": "fewer than 15 development round trips for every candidate"}); continue
+                if not eligible:
+                    maximum_trades = max(item["development"]["metrics"]["trade_count"] for item in evidence)
+                    insufficient.append({"symbol": symbol, "reason": f"maximum available history produced only {maximum_trades} round trips; 15 required", "development_start": dev_bars[0]["timestamp"][:10], "development_end": spec["cutoff"], "development_bars": len(dev_bars)})
+                    continue
                 best = sorted(eligible, key=lambda item: (-item["score"], -(item["development"]["metrics"]["sortino"] or -999), item["development"]["metrics"]["maximum_drawdown_percent"], -item["development"]["metrics"]["trade_count"], item["development"]["metrics"]["turnover_percent"]))[0]
                 candidates.append({"symbol": symbol, "name": asset["name"], "mic": asset["mic"], "primary_venue": asset["primary_venue"], "adr_status": asset["adr_status"], "other_share_classes": asset.get("other_share_classes", []), **facts, "dataset": {"id": dataset_id, "first_bar": bars[0]["timestamp"], "last_bar": bars[-1]["timestamp"], "retrieved": iso(), "content_hash": digest(bars), "adjustment": "all", "corporate_actions_applied": asset["corporate_actions_applied"]}, "evidence": best, "score": best["score"]})
             except Exception as exc: insufficient.append({"symbol": symbol, "reason": str(exc.detail if isinstance(exc, HTTPException) else exc)})
