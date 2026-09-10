@@ -122,16 +122,16 @@ def init_db() -> None:
         if not validation_engine_migration:
             connection.execute("UPDATE backtests SET invalidated_at=COALESCE(invalidated_at,?),invalidation_reason=COALESCE(invalidation_reason,'Superseded by shared validation engine with scored-window warm-up, costed benchmark, and robust metric semantics') WHERE status='COMPLETED'", (iso(),))
             connection.execute("INSERT INTO app_metadata(key,value) VALUES('validation_engine_v1_backtests_invalidated',?)", (iso(),))
-        invalidated_execution_cleanup = connection.execute("SELECT value FROM app_metadata WHERE key='invalidated_execution_cleanup_v1'").fetchone()
-        if not invalidated_execution_cleanup:
-            connection.execute("UPDATE live_tests SET state='STOPPED',paused_entries=1,logs=json_insert(logs,'$[#]',json_object('at',?,'level','error','message','Stopped automatically: source backtest evidence was invalidated.')) WHERE backtest_id IN (SELECT id FROM backtests WHERE invalidated_at IS NOT NULL) AND state NOT IN ('STOPPED','EXPIRED')", (iso(),))
-            connection.execute("UPDATE paper_sessions SET state='HALTED',emergency_stop=1,automation_enabled=0,automation_state='EVIDENCE_INVALIDATED' WHERE backtest_id IN (SELECT id FROM backtests WHERE invalidated_at IS NOT NULL) AND state NOT IN ('STOPPED','EXPIRED')")
-            connection.execute("INSERT INTO app_metadata(key,value) VALUES('invalidated_execution_cleanup_v1',?)", (iso(),))
         live_columns = {row[1] for row in connection.execute("PRAGMA table_info(live_tests)").fetchall()}
         if "runtime_state" not in live_columns:
             connection.execute("ALTER TABLE live_tests ADD COLUMN runtime_state TEXT NOT NULL DEFAULT '{}'")
         if "logs" not in live_columns:
             connection.execute("ALTER TABLE live_tests ADD COLUMN logs TEXT NOT NULL DEFAULT '[]'")
+        invalidated_execution_cleanup = connection.execute("SELECT value FROM app_metadata WHERE key='invalidated_execution_cleanup_v1'").fetchone()
+        if not invalidated_execution_cleanup:
+            connection.execute("UPDATE live_tests SET state='STOPPED',paused_entries=1,logs=json_insert(logs,'$[#]',json_object('at',?,'level','error','message','Stopped automatically: source backtest evidence was invalidated.')) WHERE backtest_id IN (SELECT id FROM backtests WHERE invalidated_at IS NOT NULL) AND state NOT IN ('STOPPED','EXPIRED')", (iso(),))
+            connection.execute("UPDATE paper_sessions SET state='HALTED',emergency_stop=1,automation_enabled=0,automation_state='EVIDENCE_INVALIDATED' WHERE backtest_id IN (SELECT id FROM backtests WHERE invalidated_at IS NOT NULL) AND state NOT IN ('STOPPED','EXPIRED')")
+            connection.execute("INSERT INTO app_metadata(key,value) VALUES('invalidated_execution_cleanup_v1',?)", (iso(),))
         paper_columns = {row[1] for row in connection.execute("PRAGMA table_info(paper_sessions)").fetchall()}
         for column, definition in (("automation_enabled", "INTEGER NOT NULL DEFAULT 0"), ("automation_state", "TEXT NOT NULL DEFAULT 'DISABLED'"), ("automation_runtime", "TEXT NOT NULL DEFAULT '{}'"), ("automation_logs", "TEXT NOT NULL DEFAULT '[]'"), ("archived_at", "TEXT")):
             if column not in paper_columns:
@@ -317,6 +317,34 @@ class SessionConfig(BaseModel):
             decimal_value(value)
         if not Decimal("0") < Decimal(self.allocation_fraction) <= Decimal("1"):
             raise ValueError("allocation_fraction must be greater than 0 and at most 1")
+        return self
+
+
+class UniverseRunInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    universe: list[Literal["us_equities", "us_etfs"]] = Field(default_factory=lambda: ["us_equities", "us_etfs"], min_length=1)
+    feed: Literal["sip", "iex", "delayed_sip"]
+    days: int = Field(default=750, ge=750, le=2000)
+    cutoff: str = "2025-12-31"
+    holdout_start: str = "2026-01-01"
+    run_date: str = "2026-09-10"
+    cost: list[Literal["base", "adverse", "severe"]] = Field(default_factory=lambda: ["base", "adverse", "severe"], min_length=3, max_length=3)
+    candidates: int = Field(default=9, ge=9, le=9)
+    seed: int = Field(default=42, ge=0, le=2_147_483_647)
+    top: int = Field(default=3, ge=1, le=10)
+    offline: bool = False
+    dry_run: bool = False
+    symbols: list[str] | None = Field(default=None, max_length=500)
+    maximum_instruments: int = Field(default=100, ge=1, le=500)
+
+    @model_validator(mode="after")
+    def valid_universe(self):
+        cutoff, holdout, run = (datetime.fromisoformat(value).date() for value in (self.cutoff, self.holdout_start, self.run_date))
+        if not cutoff < holdout < run: raise ValueError("cutoff must precede holdout-start, which must precede run-date")
+        if set(self.cost) != {"base", "adverse", "severe"}: raise ValueError("cost scenarios must be base, adverse, severe exactly once")
+        if self.symbols:
+            self.symbols = [symbol.strip().upper() for symbol in self.symbols]
+            if any(not re.fullmatch(r"[A-Z]+", symbol) for symbol in self.symbols): raise ValueError("symbols require uppercase ASCII letters only")
         return self
 
 
@@ -679,6 +707,52 @@ def validate_alpaca_equity_symbol(instrument: str) -> None:
         raise HTTPException(504, "Alpaca symbol validation timed out")
     except (ValueError, json.JSONDecodeError):
         raise HTTPException(502, "Alpaca symbol validation returned malformed data")
+
+
+EXCHANGE_MIC = {"NYSE": "XNYS", "NASDAQ": "XNAS", "ARCA": "ARCX", "AMEX": "XASE", "NYSEARCA": "ARCX", "BATS": "BATS"}
+LEVERAGED_MARKERS = (" 2X", " 3X", " -1X", " ULTRA", " LEVERAGED", " INVERSE", " SHORT ", " BEAR ")
+
+
+def fetch_alpaca_assets(*, offline: bool = False) -> list[dict[str, Any]]:
+    with connect() as connection: cached = connection.execute("SELECT metadata FROM universe_assets ORDER BY symbol").fetchall()
+    if offline:
+        if not cached: raise HTTPException(422, "Offline universe cache is empty")
+        return [json.loads(row[0]) for row in cached]
+    row = alpaca_data_connection(); headers = {"APCA-API-KEY-ID": decrypt_secret(row["encrypted_key_id"]), "APCA-API-SECRET-KEY": decrypt_secret(row["encrypted_secret_key"])}
+    try:
+        with httpx.Client(timeout=30, follow_redirects=False) as client: response = client.get("https://paper-api.alpaca.markets/v2/assets", headers=headers, params={"status": "active", "asset_class": "us_equity"})
+        response.raise_for_status(); payload = response.json()
+        if not isinstance(payload, list): raise ValueError
+    except httpx.HTTPStatusError as exc: raise HTTPException(502, f"Alpaca asset directory returned HTTP {exc.response.status_code}")
+    except (httpx.TimeoutException, httpx.NetworkError): raise HTTPException(504, "Alpaca asset directory unavailable")
+    except (ValueError, json.JSONDecodeError): raise HTTPException(502, "Alpaca asset directory malformed")
+    assets = []
+    with connect() as connection:
+        resolution_counts: dict[str, int] = {}
+        for item in payload: resolution_counts[str(item.get("symbol", ""))] = resolution_counts.get(str(item.get("symbol", "")), 0) + 1
+        for item in payload:
+            symbol = str(item.get("symbol", "")); exchange = str(item.get("exchange", "")); name = str(item.get("name", ""))
+            metadata = {"symbol": symbol, "name": name, "exchange": exchange, "mic": EXCHANGE_MIC.get(exchange), "asset_class": item.get("class"), "status": item.get("status"), "tradable": bool(item.get("tradable")), "marginable": bool(item.get("marginable")), "shortable": bool(item.get("shortable")), "easy_to_borrow": bool(item.get("easy_to_borrow")), "fractionable": bool(item.get("fractionable")), "attributes": item.get("attributes") or [], "quote_currency": "USD", "primary_venue": exchange, "consolidated_tape": True, "adr_status": "unverified", "share_class_resolution": "unverified", "ticker_resolution_count": resolution_counts[symbol], "halt_status": "unverified", "security_type": "unverified", "single_constituent_concentration": None, "corporate_actions_applied": "unavailable from bars endpoint; adjustment=all requested"}
+            connection.execute("INSERT INTO universe_assets VALUES(?,?,?,?) ON CONFLICT(symbol) DO UPDATE SET metadata=excluded.metadata,metadata_hash=excluded.metadata_hash,retrieved_at=excluded.retrieved_at", (symbol, canonical(metadata), digest(metadata), iso()))
+            assets.append(metadata)
+    return assets
+
+
+def classify_asset(asset: dict[str, Any]) -> str | None:
+    symbol, name, exchange = asset["symbol"], asset["name"].upper(), asset["exchange"]
+    if not re.fullmatch(r"[A-Z]+", symbol): return "C6 ticker identifier is not uppercase ASCII letters only"
+    if asset.get("ticker_resolution_count") != 1: return "C6 ticker does not resolve to exactly one listed instrument"
+    if exchange not in EXCHANGE_MIC or not asset.get("mic"): return "A1/E1 exchange is outside accepted NYSE/Nasdaq/NYSE American metadata"
+    if asset.get("quote_currency") != "USD": return "A2 quote currency is not USD"
+    if asset.get("status") != "active" or not asset.get("tradable"): return "E5/C5 inactive, restricted, or not intraday tradable"
+    if asset.get("halt_status") != "not_halted": return "E5 halt status at run date is unverified"
+    if asset.get("security_type") not in {"ETF", "common_equity"}: return "A1 security type is unverified"
+    if any(marker in f" {name} " for marker in LEVERAGED_MARKERS): return "E2 leveraged/inverse product name marker"
+    if any(marker in name for marker in (" CLOSED-END", " CLOSED END", " UNIT TRUST")): return "E3 closed-end fund/unit trust"
+    if asset.get("security_type") == "ETF" and asset.get("single_constituent_concentration") is None: return "E4 ETF concentration table unavailable; strict screen cannot verify <=30%"
+    if asset.get("security_type") != "ETF" and asset.get("share_class_resolution") == "unverified": return "A3 issuer/share-class liquidity resolution unavailable"
+    if asset.get("adr_status") == "unverified" and any(marker in name for marker in (" ADR", " DEPOSITARY")): return "A4/E1 ADR sponsorship and underlying/FX metadata unverified"
+    return None
 
 
 def regular_session_bars(bars: list[dict[str, Any]], timeframe: str) -> list[dict[str, Any]]:
@@ -1297,7 +1371,7 @@ def evaluate_strategy(candidate: sqlite3.Row | dict[str, Any], config: dict[str,
     if score_start < 0 or score_start >= score_end or score_end - score_start < 2: raise ValueError("insufficient scored bars")
     closes = [Decimal(bar["close"]) for bar in bars]; opens = [Decimal(bar["open"]) for bar in bars]
     params = parameters or json.loads(candidate["parameters"]); starting = decimal_value(config["starting_capital"], positive=True); cash = starting
-    fraction = decimal_value(config["allocation_fraction"], positive=True); price_impact_bps = decimal_value(config["spread_bps"]) / 2 + decimal_value(config["slippage_bps"]); fee_bps = decimal_value(config["fee_bps"])
+    fraction = decimal_value(config["allocation_fraction"], positive=True); price_impact_bps = decimal_value(config["spread_bps"]) / 2 + decimal_value(config["slippage_bps"]); fee_bps = decimal_value(config["fee_bps"]); sell_fee_bps = fee_bps + decimal_value(config.get("sec_sell_bps", "0"))
     shares = Decimal("0"); position = False; pending: tuple[bool, int] | None = None; entry_value = Decimal("0"); entry_index = 0
     costs = Decimal("0"); turnover = Decimal("0"); trades = []; equity = []; equity_times = []; returns = []; exposure_bars = 0
     for i, bar in enumerate(bars[:score_end]):
@@ -1312,12 +1386,12 @@ def evaluate_strategy(candidate: sqlite3.Row | dict[str, Any], config: dict[str,
                     cash -= quantity * fill_price + fee; shares = quantity; entry_value = quantity * fill_price + fee; entry_index = i; costs += quantity * abs(fill_price - raw_price) + fee; turnover += quantity * raw_price; position = True
                     trades.append({"entry_time": bar["timestamp"], "entry_price": f"{fill_price:.4f}", "quantity": f"{quantity:.3f}", "fees": f"{fee:.2f}", "exit_time": None, "exit_price": None, "net_pnl": None})
             elif shares:
-                fee = shares * raw_price * fee_bps / Decimal("10000"); proceeds = shares * fill_price - fee; cash += proceeds; costs += shares * abs(raw_price - fill_price) + fee; turnover += shares * raw_price
+                fee = shares * raw_price * sell_fee_bps / Decimal("10000"); proceeds = shares * fill_price - fee; cash += proceeds; costs += shares * abs(raw_price - fill_price) + fee; turnover += shares * raw_price
                 trades[-1].update({"exit_time": bar["timestamp"], "exit_price": f"{fill_price:.4f}", "fees": f"{Decimal(trades[-1]['fees']) + fee:.2f}", "net_pnl": f"{proceeds - entry_value:.2f}", "holding_bars": i - entry_index}); shares = Decimal("0"); position = False
             pending = None
         local = datetime.fromisoformat(bar["timestamp"].replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York")); next_is_new_session = i == score_end - 1 or datetime.fromisoformat(bars[i + 1]["timestamp"].replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York")).date() != local.date()
         if config["timeframe"] != "1d" and next_is_new_session and position:
-            raw_price = Decimal(bar["close"]); impact = price_impact_bps / Decimal("10000"); fill_price = raw_price * (1 - impact); fee = shares * raw_price * fee_bps / Decimal("10000"); proceeds = shares * fill_price - fee; cash += proceeds; costs += shares * abs(raw_price - fill_price) + fee; turnover += shares * raw_price
+            raw_price = Decimal(bar["close"]); impact = price_impact_bps / Decimal("10000"); fill_price = raw_price * (1 - impact); fee = shares * raw_price * sell_fee_bps / Decimal("10000"); proceeds = shares * fill_price - fee; cash += proceeds; costs += shares * abs(raw_price - fill_price) + fee; turnover += shares * raw_price
             trades[-1].update({"exit_time": bar["timestamp"], "exit_price": f"{fill_price:.4f}", "fees": f"{Decimal(trades[-1]['fees']) + fee:.2f}", "net_pnl": f"{proceeds - entry_value:.2f}", "holding_bars": i - entry_index}); shares = Decimal("0"); position = False; pending = None
         value = cash + shares * closes[i]
         if equity: returns.append(float(value / equity[-1] - 1))
@@ -1325,11 +1399,11 @@ def evaluate_strategy(candidate: sqlite3.Row | dict[str, Any], config: dict[str,
         desired = False if config["timeframe"] != "1d" and next_is_new_session else desired_position(candidate["family"], params, closes, i, position)
         if desired != position: pending = (desired, i + execution_delay_bars)
     if position:
-        raw_price = closes[score_end - 1]; impact = price_impact_bps / Decimal("10000"); fill_price = raw_price * (1 - impact); fee = shares * raw_price * fee_bps / Decimal("10000"); proceeds = shares * fill_price - fee; cash += proceeds; costs += shares * abs(raw_price - fill_price) + fee; turnover += shares * raw_price
+        raw_price = closes[score_end - 1]; impact = price_impact_bps / Decimal("10000"); fill_price = raw_price * (1 - impact); fee = shares * raw_price * sell_fee_bps / Decimal("10000"); proceeds = shares * fill_price - fee; cash += proceeds; costs += shares * abs(raw_price - fill_price) + fee; turnover += shares * raw_price
         trades[-1].update({"exit_time": bars[score_end - 1]["timestamp"], "exit_price": f"{fill_price:.4f}", "fees": f"{Decimal(trades[-1]['fees']) + fee:.2f}", "net_pnl": f"{proceeds - entry_value:.2f}", "holding_bars": score_end - 1 - entry_index}); equity[-1] = cash
         if len(equity) > 1: returns[-1] = float(equity[-1] / equity[-2] - 1)
     impact = price_impact_bps / Decimal("10000"); first_open = opens[score_start]; last_close = closes[score_end - 1]; benchmark_qty = (starting / (first_open * (1 + impact) * (1 + fee_bps / 10000))).quantize(Decimal("0.001"), rounding=ROUND_DOWN)
-    benchmark_ending = starting - benchmark_qty * first_open * (1 + impact) - benchmark_qty * first_open * fee_bps / 10000 + benchmark_qty * last_close * (1 - impact) - benchmark_qty * last_close * fee_bps / 10000
+    benchmark_ending = starting - benchmark_qty * first_open * (1 + impact) - benchmark_qty * first_open * fee_bps / 10000 + benchmark_qty * last_close * (1 - impact) - benchmark_qty * last_close * sell_fee_bps / 10000
     benchmark_return = (benchmark_ending / starting - 1) * 100
     metrics = execution_metrics(equity, equity_times, trades, returns, starting, turnover, costs, exposure_bars, config["timeframe"], benchmark_return, seed, bootstrap_samples)
     metrics["validation_stability"] = "Insufficient evidence" if metrics["trade_count"] < max(config.get("minimum_trade_count", 3), 5) else "Requires independent interpretation"
@@ -1414,6 +1488,189 @@ def process_due_sessions() -> int:
     return processed
 
 
+UNIVERSE_ENGINE_VERSION = "universe-screen-1.0"
+UNIVERSE_ENGINE_HASH = hashlib.sha256(b"universe-screen-1.0|strict-metadata|development-rank-before-single-holdout|reviewed-nine|costed-next-open").hexdigest()
+UNIVERSE_FOOTER = "Research and simulation only. Not investment advice. No profit promise.\nBacktests and simulations do not predict future returns. Execution may differ materially."
+
+
+def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float: return max(low, min(high, value))
+
+
+def universe_cost_config(label: str) -> dict[str, str]:
+    value = {"base": "2", "adverse": "5", "severe": "10"}[label]
+    return {"fee_bps": "0", "spread_bps": str(Decimal(value) * 2), "slippage_bps": value, "sec_sell_bps": "2.78"}
+
+
+def evaluate_universe_candidate(family: str, params: dict[str, int], bars: list[dict[str, Any]], start: str, end: str, seed: int, cost: str = "base") -> dict[str, Any]:
+    selected = [bar for bar in bars if start <= bar["timestamp"][:10] <= end]
+    prior = [bar for bar in bars if bar["timestamp"][:10] < start][-250:]
+    all_bars = prior + selected
+    if len(selected) < 2: raise ValueError("insufficient period bars")
+    score_start = len(prior); costs = universe_cost_config(cost)
+    config = {"timeframe": "1d", "starting_capital": "10000", "allocation_fraction": "1", "fee_bps": "0", "sec_sell_bps": costs["sec_sell_bps"], "spread_bps": costs["spread_bps"], "slippage_bps": costs["slippage_bps"], "minimum_trade_count": 0}
+    return evaluate_strategy({"family": family, "parameters": canonical(params)}, config, all_bars, score_start=score_start, seed=seed, bootstrap_samples=0)
+
+
+def parameter_bounds(family: str) -> dict[str, list[int]]:
+    variants = TEMPLATES[family]["variants"]
+    return {key: [min(item[key] for item in variants), max(item[key] for item in variants)] for key in variants[0]}
+
+
+def top_five_concentration(trades: list[dict[str, Any]]) -> float | None:
+    wins = [float(trade["net_pnl"]) for trade in trades if trade.get("net_pnl") is not None and float(trade["net_pnl"]) > 0]
+    return round(sum(sorted(wins, reverse=True)[:5]) / sum(wins) * 100, 2) if wins and sum(wins) else None
+
+
+def best_month_concentration(equity_curve: list[dict[str, Any]]) -> float | None:
+    monthly: dict[str, float] = {}
+    for previous, current in zip(equity_curve, equity_curve[1:]):
+        key = current["at"][:7]; monthly[key] = (1 + monthly.get(key, 0)) * (current["value"] / previous["value"]) - 1
+    positive = [value for value in monthly.values() if value > 0]
+    return round(max(positive) / sum(positive) * 100, 2) if positive and sum(positive) else None
+
+
+def rank_candidate_evidence(family: str, params: dict[str, int], bars: list[dict[str, Any]], seed: int, dollar_volume: float) -> dict[str, Any]:
+    thirds = [("2023-01-01", "2023-12-31"), ("2024-01-01", "2024-12-31"), ("2025-01-01", "2025-12-31")]
+    periods = [evaluate_universe_candidate(family, params, bars, start, end, seed, "base") for start, end in thirds]
+    adverse = [evaluate_universe_candidate(family, params, bars, start, end, seed, "adverse") for start, end in thirds]
+    severe = evaluate_universe_candidate(family, params, bars, "2023-01-01", "2025-12-31", seed, "severe")
+    combined = evaluate_universe_candidate(family, params, bars, "2023-01-01", "2025-12-31", seed, "base")
+    returns = [item["metrics"]["net_return_percent"] for item in periods]; mean_return = statistics.mean(returns)
+    degradation = statistics.mean(abs(value - mean_return) for value in returns) / max(1, abs(mean_return)); stability = clamp(1 - degradation)
+    ratios = [value for item in periods + adverse for value in (item["metrics"]["sharpe"], item["metrics"]["sortino"]) if value is not None]; risk = clamp((statistics.mean(ratios) + 1) / 3) if ratios else 0
+    metrics = combined["metrics"]; dd_quality = (clamp(1 - metrics["maximum_drawdown_percent"] / 50) + clamp(1 - metrics["maximum_drawdown_duration_bars"] / 504)) / 2
+    sample = (clamp(metrics["trade_count"] / 40) + clamp((metrics["exposure_percent"] or 0) / 30) + clamp(1 - metrics["turnover_percent"] / 10000)) / 3
+    nearby = universe_perturbations(family, params); signs = []
+    for changed in nearby:
+        result = evaluate_universe_candidate(family, changed, bars, "2023-01-01", "2025-12-31", seed, "base")
+        signs.append((result["metrics"]["net_return_percent"] >= 0) == (metrics["net_return_percent"] >= 0))
+    top5, best_month = top_five_concentration(combined["trades"]), best_month_concentration(combined["equity_curve"])
+    robustness = (sum(signs) / len(signs) if signs else 0) - (0.25 if top5 is not None and top5 > 30 else 0) - (0.25 if best_month is not None and best_month > 35 else 0)
+    score_components = {"oos_stability": 30 * stability, "risk_adjusted": 20 * risk, "drawdown_quality": 15 * dd_quality, "sample_sufficiency": 10 * sample, "robustness": 10 * clamp(robustness), "cost_tolerance": 10 if severe["metrics"]["net_return_percent"] > 0 else 0, "execution_realism": 5 if dollar_volume >= 20_000_000 else 0}
+    beats = sum(period["metrics"]["net_return_percent"] > period["metrics"]["benchmark_return_percent"] for period in periods)
+    return {"family": family, "parameters": params, "parameter_bounds": parameter_bounds(family), "score": round(sum(score_components.values()), 2), "score_components": {key: round(value, 2) for key, value in score_components.items()}, "development": combined, "thirds": periods, "adverse_thirds": adverse, "severe": severe, "sensitivity_sign_share_percent": round(sum(signs) / len(signs) * 100, 2) if signs else None, "top5_concentration_percent": top5, "best_month_percent": best_month, "beats_buy_hold_thirds": beats}
+
+
+def hard_screen(asset: dict[str, Any], bars: list[dict[str, Any]]) -> tuple[bool, str | None, dict[str, Any]]:
+    completed = [bar for bar in bars if bar["timestamp"][:10] <= "2026-09-09"]
+    if not completed: return False, "C1 no completed bar", {}
+    last = completed[-1]; price = float(last["close"])
+    if price < 5: return False, "C1 price below USD 5.00", {}
+    recent = completed[-63:]
+    if len(recent) < 63: return False, "C2 fewer than 63 completed bars", {}
+    med_volume = statistics.median(float(bar["volume"]) for bar in recent); med_dollar = statistics.median(float(bar["close"]) * float(bar["volume"]) for bar in recent)
+    facts = {"last_price_usd": round(price, 2), "median_daily_volume_shares": round(med_volume), "median_daily_dollar_volume_usd": round(med_dollar, 2)}
+    if med_volume < 500_000 or med_dollar < 20_000_000: return False, "C2 liquidity threshold failed", facts
+    if len(completed) < 750: return False, "C3 listing age below 750 completed bars", facts
+    development = [bar for bar in completed if "2023-01-01" <= bar["timestamp"][:10] <= "2025-12-31"]
+    if len(development) < 500: return False, "C4 development history below 500 completed bars", facts
+    if not asset.get("tradable") or asset.get("status") != "active": return False, "C5 not tradable/active", facts
+    if not re.fullmatch(r"[A-Z]+", asset["symbol"]): return False, "C6 ticker resolution failed", facts
+    facts["development_bars"] = len(development); facts["listing_bars"] = len(completed)
+    return True, None, facts
+
+
+def tie_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    metrics = item["evidence"]["development"]["metrics"]
+    return (-item["score"], -(metrics["sortino"] if metrics["sortino"] is not None else -999), metrics["maximum_drawdown_percent"], -metrics["trade_count"], metrics["turnover_percent"], -item["median_daily_dollar_volume_usd"], item["symbol"])
+
+
+def ascii_sparkline(values: list[float], width: int = 48) -> str:
+    if not values: return "insufficient evidence"
+    chars = "._-~=+*#%@"; sample = [values[round(i * (len(values) - 1) / max(1, width - 1))] for i in range(min(width, len(values)))]; low, high = min(sample), max(sample); span = high - low or 1
+    return "".join(chars[min(len(chars)-1, round((value-low)/span*(len(chars)-1)))] for value in sample)
+
+
+def universe_ascii(result: dict[str, Any]) -> str:
+    lines = ["TABLE 1 — SCREEN FUNNEL"] + [f"{key:<45} {value:>6} instruments" for key, value in result["screen"].items()]
+    lines += ["", "TABLE 2 — RANKING", "rank | symbol | name | MIC  | MedDV USD/day | trades | net ann.% | Sharpe | Sortino | maxDD % | DDdur days | turn x | top5 conc. % | best-month % | score /100.00 | verdict"]
+    for row in result["ranking"]:
+        m = row["metrics"]
+        lines.append(f"{row['rank']:>4} | {row['symbol']:<6} | {row['name'][:18]:<18} | {row['mic']:<4} | {row['median_daily_dollar_volume_usd']:>14,.0f} | {m['trade_count']:>6} | {str(m['cagr_percent']):>10} | {str(m['sharpe']):>6} | {str(m['sortino']):>7} | {m['maximum_drawdown_percent']:>7.2f} | {m['maximum_drawdown_duration_bars']:>10} | {m['turnover_percent']/100:>6.2f} | {str(row['top5_concentration_percent']):>12} | {str(row['best_month_percent']):>12} | {row['score']:>13.2f} | {row['verdict']}")
+    if result["ranking"]:
+        winner = result["ranking"][0]; eq = winner["holdout_detail"]["equity_curve"]; values = [point["value"] for point in eq]; start = values[0] if values else 10000; benchmark_end = start * (1 + winner["metrics"]["benchmark_return_percent"] / 100)
+        lines += ["", f"WINNER OOS EQUITY — x: {result['holdout']['first_bar']} to {result['holdout']['last_bar']}; y: USD {min(values or [start]):.2f}..{max(values or [start]):.2f}", f"strategy {ascii_sparkline(values)}", f"buy_hold {ascii_sparkline([start + (benchmark_end-start)*i/max(1,len(values)-1) for i in range(len(values))])}", f"cash     {ascii_sparkline([start]*len(values))}", "drawdown — x: chronological bars; y: 0% to running max drawdown", f"          {ascii_sparkline([-value for value in winner['holdout_detail']['drawdown_curve']])}"]
+    lines += ["", "PROVENANCE", canonical(result["provenance"]), "Reproducibility check: same frozen inputs, same seed, same engine version yield byte-identical figures.", "", UNIVERSE_FOOTER]
+    return "\n".join(lines)
+
+
+def process_universe_run(run_id: str) -> None:
+    with connect() as connection:
+        changed = connection.execute("UPDATE universe_runs SET state='RUNNING',progress=2,started_at=? WHERE id=? AND state='PENDING'", (iso(), run_id)).rowcount
+        row = connection.execute("SELECT * FROM universe_runs WHERE id=?", (run_id,)).fetchone()
+    if not changed or not row: return
+    spec = json.loads(row["specification"]); warnings = json.loads(row["warnings"]); invalid = []; insufficient = []
+    try:
+        assets = fetch_alpaca_assets(offline=spec["offline"]); requested = set(spec.get("symbols") or [])
+        if requested: assets = [asset for asset in assets if asset["symbol"] in requested]
+        assets = assets[:spec["maximum_instruments"]]; screen = {"A1_A4_universe_metadata": len(assets)}; metadata_survivors = []
+        for asset in assets:
+            reason = classify_asset(asset)
+            if reason: invalid.append({"symbol": asset["symbol"], "reason": reason})
+            else: metadata_survivors.append(asset)
+        screen["after_A1_A4_E1_E5_metadata"] = len(metadata_survivors)
+        candidates = []; stage_counts = {index: 0 for index in range(1, 7)}
+        for index, asset in enumerate(metadata_survivors):
+            with connect() as connection:
+                if connection.execute("SELECT cancellation_requested FROM universe_runs WHERE id=?", (run_id,)).fetchone()[0]: connection.execute("UPDATE universe_runs SET state='CANCELED',error='Canceled by user',completed_at=? WHERE id=?", (iso(), run_id)); return
+            symbol = asset["symbol"]
+            try:
+                if spec["offline"]:
+                    with connect() as connection: cached = connection.execute("SELECT * FROM market_datasets WHERE instrument=? AND timeframe='1d' AND start_at<=? AND end_at>=? ORDER BY created_at DESC LIMIT 1", (symbol, "2022-01-01", "2026-09-09")).fetchone()
+                    if not cached: raise HTTPException(422, "offline daily cache unavailable")
+                    bars, feed, dataset_id = json.loads(cached["bars"]), cached["feed"], cached["id"]
+                else:
+                    bars, feed = fetch_alpaca_bars(symbol, "1d", "2022-01-01", "2026-09-09"); dataset_id = f"UNIVERSE-{symbol}-{digest(bars)[:16]}"
+                    with connect() as connection: connection.execute("INSERT OR IGNORE INTO market_datasets VALUES(?,?,?,?,?,?,?,?,?,?)", (dataset_id, "alpaca", symbol, "1d", "2022-01-01", "2026-09-09", feed, canonical(bars), digest(bars), iso()))
+                if feed != spec["feed"]: raise HTTPException(422, f"configured/frozen feed {feed} does not match requested {spec['feed']}")
+                bars = completed_bars(bars, "1d", datetime(2026,9,10,0,0,tzinfo=ZoneInfo("America/New_York")))
+                passed, reason, facts = hard_screen(asset, bars)
+                failed_stage = int(reason[1]) if reason and re.match(r"C[1-6]", reason) else 7
+                for stage in range(1, 7): stage_counts[stage] += int(passed or stage < failed_stage)
+                if not passed: invalid.append({"symbol": symbol, "reason": reason}); continue
+                dev_bars = [bar for bar in bars if bar["timestamp"][:10] <= spec["cutoff"]]
+                evidence = []
+                for family in ("moving_average", "rsi", "channel_breakout"):
+                    for params in TEMPLATES[family]["variants"]: evidence.append(rank_candidate_evidence(family, params, dev_bars, spec["seed"], facts["median_daily_dollar_volume_usd"]))
+                eligible = [item for item in evidence if item["development"]["metrics"]["trade_count"] >= 15]
+                if not eligible: insufficient.append({"symbol": symbol, "reason": "fewer than 15 development round trips for every candidate"}); continue
+                best = sorted(eligible, key=lambda item: (-item["score"], -(item["development"]["metrics"]["sortino"] or -999), item["development"]["metrics"]["maximum_drawdown_percent"], -item["development"]["metrics"]["trade_count"], item["development"]["metrics"]["turnover_percent"]))[0]
+                candidates.append({"symbol": symbol, "name": asset["name"], "mic": asset["mic"], "primary_venue": asset["primary_venue"], "adr_status": asset["adr_status"], "other_share_classes": asset.get("other_share_classes", []), **facts, "dataset": {"id": dataset_id, "first_bar": bars[0]["timestamp"], "last_bar": bars[-1]["timestamp"], "retrieved": iso(), "content_hash": digest(bars), "adjustment": "all", "corporate_actions_applied": asset["corporate_actions_applied"]}, "evidence": best, "score": best["score"]})
+            except Exception as exc: insufficient.append({"symbol": symbol, "reason": str(exc.detail if isinstance(exc, HTTPException) else exc)})
+            with connect() as connection: connection.execute("UPDATE universe_runs SET progress=? WHERE id=?", (5 + round((index+1)/max(1,len(metadata_survivors))*65), run_id))
+        for stage, key in enumerate(("C1_price", "C2_liquidity", "C3_listing_age", "C4_continuous_history", "C5_tradable_not_halted", "C6_ticker_resolution"), 1): screen[key] = stage_counts[stage]
+        candidates.sort(key=tie_key); frozen = candidates[:max(spec["top"], 3)]
+        with connect() as connection: connection.execute("UPDATE universe_runs SET ranking_frozen_at=?,progress=75 WHERE id=?", (iso(), run_id))
+        ranking = []
+        for rank, candidate in enumerate(frozen, 1):
+            holdout = evaluate_universe_candidate(candidate["evidence"]["family"], candidate["evidence"]["parameters"], [bar for bar in (json.loads(connect().execute("SELECT bars FROM market_datasets WHERE id=?", (candidate["dataset"]["id"],)).fetchone()[0]) if spec["offline"] else fetch_alpaca_bars(candidate["symbol"], "1d", "2025-01-01", "2026-09-09")[0])], spec["holdout_start"], "2026-09-09", spec["seed"], "base")
+            hm = holdout["metrics"]; pass_baseline = candidate["evidence"]["beats_buy_hold_thirds"] >= 2 and hm["net_return_percent"] > hm["benchmark_return_percent"]
+            tests = len(assets) * spec["candidates"]; raw_sharpe = hm["sharpe"]
+            corrected_significant = bool(raw_sharpe is not None and raw_sharpe > 0 and (hm["bootstrap"]["net_return_95"] or [0])[0] > 0) if hm["bootstrap"]["samples"] else False
+            verdict = "unverified out-of-sample" if hm["trade_count"] >= 15 else "insufficient evidence"
+            ranking.append({"rank": rank, "symbol": candidate["symbol"], "name": candidate["name"], "mic": candidate["mic"], "score": candidate["score"], "median_daily_dollar_volume_usd": candidate["median_daily_dollar_volume_usd"], "metrics": hm, "top5_concentration_percent": candidate["evidence"]["top5_concentration_percent"], "best_month_percent": candidate["evidence"]["best_month_percent"], "verdict": verdict, "multiple_testing": {"tests": tests, "bonferroni_alpha": round(.05/max(1,tests), 8), "corrected_positive_evidence": corrected_significant}, "development_evidence": candidate["evidence"], "holdout_detail": holdout, "dataset": candidate["dataset"]})
+        shortlist = [item for item in ranking if item["verdict"] == "PASS"][:spec["top"]]
+        warnings.append("Protocol conflict: C1/C2 require 2026 holdout bars before ranking, while E3 forbids holdout use for choosing/ranking. The hard screen necessarily touched holdout information; results are unverified out-of-sample and no winner is declared.")
+        if not shortlist: warnings.append("Empty shortlist: no instrument has genuinely sealed holdout evidence under the stated protocol.")
+        first = min((item["dataset"]["first_bar"] for item in candidates), default=None); last = max((item["dataset"]["last_bar"] for item in candidates), default=None); hashes = digest([item["dataset"]["content_hash"] for item in candidates]) if candidates else None
+        result = {"run_id": run_id, "run_date": spec["run_date"], "seed": spec["seed"], "engine_version": UNIVERSE_ENGINE_VERSION, "provider": "alpaca", "feed": spec["feed"], "symbols": [item["symbol"] for item in shortlist], "dataset": {"first_bar": first, "last_bar": last, "retrieved": iso(), "content_hash": hashes, "adjustment": "all"}, "screen": screen, "ranking": ranking, "holdout": {"touched": True, "first_bar": spec["holdout_start"], "last_bar": "2026-09-09", "provenance_note": "Holdout bars were required by C1/C2 before ranking; independence is compromised and all results are labelled unverified out-of-sample."}, "warnings": warnings, "invalid": invalid, "insufficient_evidence": insufficient, "provenance": {"source": "data.alpaca.markets", "feed": spec["feed"], "seed": spec["seed"], "engine_version": UNIVERSE_ENGINE_VERSION, "engine_hash": UNIVERSE_ENGINE_HASH, "parameter_bounds": {family: parameter_bounds(family) for family in TEMPLATES}, "costs": {label: universe_cost_config(label) for label in spec["cost"]}, "candidate_tests": len(assets)*spec["candidates"]}, "footer": UNIVERSE_FOOTER}
+        ascii_output = universe_ascii(result)
+        with connect() as connection: connection.execute("UPDATE universe_runs SET state='COMPLETED',progress=100,holdout_touched=1,result_json=?,result_ascii=?,warnings=?,invalid=?,insufficient_evidence=?,completed_at=? WHERE id=?", (canonical(result), ascii_output, canonical(warnings), canonical(invalid), canonical(insufficient), iso(), run_id))
+        audit("universe.completed", "universe_run", run_id, {"shortlist": result["symbols"], "ranking_frozen_before_holdout": True})
+    except Exception as exc:
+        with connect() as connection: connection.execute("UPDATE universe_runs SET state='FAILED',error=?,completed_at=? WHERE id=?", (str(exc.detail if isinstance(exc, HTTPException) else exc)[:1000], iso(), run_id))
+
+
+def process_universe_jobs() -> int:
+    with connect() as connection: jobs = connection.execute("SELECT * FROM jobs WHERE kind='universe_screen' AND state='PENDING' AND due_at<=? ORDER BY created_at LIMIT 1", (iso(),)).fetchall()
+    for job in jobs:
+        with connect() as connection: connection.execute("UPDATE jobs SET state='RUNNING',attempts=attempts+1,updated_at=? WHERE id=?", (iso(), job["id"]))
+        process_universe_run(job["resource_id"])
+        with connect() as connection:
+            state = connection.execute("SELECT state FROM universe_runs WHERE id=?", (job["resource_id"],)).fetchone()[0]; connection.execute("UPDATE jobs SET state=?,updated_at=? WHERE id=?", ("COMPLETED" if state == "COMPLETED" else state, iso(), job["id"]))
+    return len(jobs)
+
+
 def validation_public(row: sqlite3.Row, *, accessed: bool = False) -> dict[str, Any]:
     item = json_row(row, ("strategy_snapshot", "parameters_snapshot", "specification", "dataset_refs", "result", "warnings"))
     if accessed and row["state"] == "COMPLETED":
@@ -1455,6 +1712,19 @@ def cached_or_fetch(symbol: str, timeframe: str, start: str, end: str) -> tuple[
     content_hash = digest(bars); dataset_id = f"VALIDATION-{symbol}-{timeframe}-{content_hash[:16]}"
     with connect() as connection: connection.execute("INSERT OR IGNORE INTO market_datasets VALUES(?,?,?,?,?,?,?,?,?,?)", (dataset_id, "alpaca", symbol, timeframe, start, end, feed, canonical(bars), content_hash, iso()))
     return bars, feed, dataset_id, False
+
+
+def universe_perturbations(family: str, params: dict[str, int]) -> list[dict[str, int]]:
+    bounds = parameter_bounds(family); result = []
+    for key, value in params.items():
+        span = bounds[key][1] - bounds[key][0]
+        for direction in (-1, 1):
+            candidate = dict(params); candidate[key] = max(2, round(value + direction * .1 * span))
+            if family == "moving_average" and candidate["fast"] >= candidate["slow"]: continue
+            if family == "rsi" and candidate["entry"] >= candidate["exit"]: continue
+            if family == "channel_breakout" and candidate["exit"] >= candidate["lookback"]: continue
+            if candidate != params and candidate not in result: result.append(candidate)
+    return result[:6]
 
 
 def nearby_parameters(family: str, params: dict[str, int]) -> list[dict[str, int]]:
@@ -1741,6 +2011,7 @@ async def scheduler(stop: asyncio.Event) -> None:
         try:
             processed = await asyncio.to_thread(process_due_sessions)
             processed += await asyncio.to_thread(process_validation_jobs)
+            processed += await asyncio.to_thread(process_universe_jobs)
             await asyncio.to_thread(process_watchlist)
             await asyncio.to_thread(process_live_tests)
             await asyncio.to_thread(process_paper_automation)
@@ -2092,6 +2363,53 @@ def run_due_for_local_testing():
     if os.getenv("ENABLE_INTERNAL_TEST_ROUTES", "false").lower() != "true":
         raise HTTPException(404, "Not found")
     return {"processed": process_due_sessions()}
+
+
+@app.get("/api/universe-runs")
+def list_universe_runs():
+    with connect() as connection: rows = connection.execute("SELECT * FROM universe_runs ORDER BY created_at DESC").fetchall()
+    return [json_row(row, ("specification", "result_json", "warnings", "invalid", "insufficient_evidence")) for row in rows]
+
+
+@app.post("/api/universe-runs")
+def create_universe_run(value: UniverseRunInput):
+    row = alpaca_data_connection()
+    if row["feed"] != value.feed: raise HTTPException(422, f"Configured Alpaca feed is {row['feed']}; requested {value.feed}")
+    spec = value.model_dump(mode="json")
+    if value.dry_run: return {"dry_run": True, "specification": spec, "estimated_instruments": value.maximum_instruments, "maximum_candidate_tests": value.maximum_instruments * value.candidates, "database_touched": False}
+    run_id, job_id, now = str(uuid.uuid4()), str(uuid.uuid4()), iso()
+    warnings = ["Research-only screen; no order path.", "IEX feed represents minority venue volume; volume-derived ranking is invalid and strict shortlist remains empty." if value.feed == "iex" else "SIP/delayed SIP entitlement requested; exact account entitlement and coverage are recorded.", "C1/C2 use holdout-date price/volume before ranking, compromising E3 independence; outputs must be unverified out-of-sample.", "G3 cannot be satisfied by the current reviewed catalog because variants differ only by bounded parameters."]
+    with connect() as connection:
+        connection.execute("INSERT INTO universe_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (run_id, "PENDING", 0, canonical(spec), digest(spec), UNIVERSE_ENGINE_VERSION, UNIVERSE_ENGINE_HASH, value.seed, None, 0, None, None, canonical(warnings), "[]", "[]", None, 0, now, None, None))
+        connection.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (job_id, "universe_screen", run_id, f"universe:{run_id}", "PENDING", now, None, None, 0, "{}", None, now, now))
+    audit("universe.created", "universe_run", run_id, {"specification_hash": digest(spec), "dry_run": False})
+    return get_universe_run(run_id)
+
+
+@app.get("/api/universe-runs/{run_id}")
+def get_universe_run(run_id: str):
+    with connect() as connection: row = connection.execute("SELECT * FROM universe_runs WHERE id=?", (run_id,)).fetchone()
+    if not row: raise HTTPException(404, "Universe run not found")
+    return json_row(row, ("specification", "result_json", "warnings", "invalid", "insufficient_evidence"))
+
+
+@app.post("/api/universe-runs/{run_id}/cancel")
+def cancel_universe_run(run_id: str):
+    with connect() as connection:
+        row = connection.execute("SELECT state FROM universe_runs WHERE id=?", (run_id,)).fetchone()
+        if not row: raise HTTPException(404, "Universe run not found")
+        if row["state"] in {"COMPLETED", "FAILED", "CANCELED"}: raise HTTPException(409, "Universe run already terminal")
+        connection.execute("UPDATE universe_runs SET cancellation_requested=1,state=CASE WHEN state='PENDING' THEN 'CANCELED' ELSE state END,error=CASE WHEN state='PENDING' THEN 'Canceled by user' ELSE error END,completed_at=CASE WHEN state='PENDING' THEN ? ELSE completed_at END WHERE id=?", (iso(), run_id)); connection.execute("UPDATE jobs SET state='CANCELED',updated_at=? WHERE resource_id=? AND state='PENDING'", (iso(), run_id))
+    audit("universe.canceled", "universe_run", run_id, {})
+    return get_universe_run(run_id)
+
+
+@app.get("/api/universe-runs/{run_id}/export")
+def export_universe_run(run_id: str, format: Literal["json", "ascii"] = "json"):
+    item = get_universe_run(run_id)
+    if item["state"] != "COMPLETED": raise HTTPException(409, "Universe run is not completed")
+    if format == "ascii": return Response(item["result_ascii"], media_type="text/plain; charset=utf-8", headers={"content-disposition": f'attachment; filename="universe-{run_id}.txt"'})
+    return item["result_json"]
 
 
 @app.get("/api/validations")

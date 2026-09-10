@@ -192,6 +192,36 @@ CREATE TABLE IF NOT EXISTS strategy_period_uses (
   created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS universe_assets (
+  symbol TEXT PRIMARY KEY,
+  metadata TEXT NOT NULL,
+  metadata_hash TEXT NOT NULL,
+  retrieved_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS universe_runs (
+  id TEXT PRIMARY KEY,
+  state TEXT NOT NULL,
+  progress INTEGER NOT NULL DEFAULT 0,
+  specification TEXT NOT NULL,
+  specification_hash TEXT NOT NULL,
+  engine_version TEXT NOT NULL,
+  engine_hash TEXT NOT NULL,
+  seed INTEGER NOT NULL,
+  ranking_frozen_at TEXT,
+  holdout_touched INTEGER NOT NULL DEFAULT 0,
+  result_json TEXT,
+  result_ascii TEXT,
+  warnings TEXT NOT NULL DEFAULT '[]',
+  invalid TEXT NOT NULL DEFAULT '[]',
+  insufficient_evidence TEXT NOT NULL DEFAULT '[]',
+  error TEXT,
+  cancellation_requested INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  completed_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS live_tests (
   id TEXT PRIMARY KEY,
   backtest_id TEXT NOT NULL REFERENCES backtests(id),
@@ -320,6 +350,7 @@ CREATE INDEX IF NOT EXISTS idx_candidates_session ON candidates(session_id,ordin
 CREATE INDEX IF NOT EXISTS idx_backtests_session ON backtests(session_id,status);
 CREATE INDEX IF NOT EXISTS idx_jobs_due ON jobs(state,due_at);
 CREATE INDEX IF NOT EXISTS idx_validation_runs_state ON validation_runs(state,created_at);
+CREATE INDEX IF NOT EXISTS idx_universe_runs_state ON universe_runs(state,created_at);
 CREATE INDEX IF NOT EXISTS idx_strategy_period_uses ON strategy_period_uses(candidate_id,start_at,end_at);
 CREATE INDEX IF NOT EXISTS idx_audit_at ON audit_events(at);
 CREATE INDEX IF NOT EXISTS idx_paper_sessions_state ON paper_sessions(state,approval_expires_at);

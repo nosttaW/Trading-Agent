@@ -83,6 +83,10 @@ AI output is schema-validated. It may select one of three reviewed templates and
 
 Backtesting is a custom deterministic engine rather than a third-party library. Reason: required shared reviewed-template semantics, exact next-event timing, narrow initial scope, zero extra engine. Limit: not a general-purpose institutional simulator. Details: [`docs/strategy-interface.md`](docs/strategy-interface.md).
 
+## Universe Screen
+
+The research-only Universe Screen applies strict US listing/metadata/liquidity/history filters, evaluates nine bounded reviewed variants, freezes development ranking before validator holdout processing, records multiple-testing diagnostics, and exports ASCII/JSON evidence. The requested reference-date screen conflicts with its sealed-holdout rule, so current strict runs correctly return an empty shortlist labelled unverified rather than fabricate a winner. See [docs/universe-screen.md](docs/universe-screen.md).
+
 ## Strategy Validation
 
 Dedicated validation runs evaluate frozen reviewed strategies on recent completed Alpaca data. Recent 30/90/180/365-day or custom periods, immutable dataset fingerprints, period-use/holdout access provenance, fixed-parameter rolling/expanding walk-forward windows, realistic cost/delay stress, nearby-parameter sensitivity, robust metrics, seeded moving-block bootstrap intervals, concentration/regimes, frozen criteria, progress/cancellation, saved comparisons, and JSON/CSV export are implemented. See [docs/validation.md](docs/validation.md) for setup, definitions, assumptions, examples, and limitations. Validation never proves future profitability.
