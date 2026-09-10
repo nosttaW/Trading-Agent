@@ -143,6 +143,7 @@ def init_db() -> None:
             connection.execute("DELETE FROM jobs WHERE kind IN ('strategy_validation','research_generation')")
             connection.execute("DELETE FROM strategy_period_uses WHERE candidate_id NOT IN (SELECT candidate_id FROM paper_sessions UNION SELECT candidate_id FROM approvals)")
             connection.execute("DELETE FROM validation_runs WHERE candidate_id NOT IN (SELECT candidate_id FROM paper_sessions UNION SELECT candidate_id FROM approvals)")
+            connection.execute("DELETE FROM live_tests WHERE candidate_id NOT IN (SELECT candidate_id FROM paper_sessions UNION SELECT candidate_id FROM approvals)")
             connection.execute("DELETE FROM strategy_reviews WHERE backtest_id NOT IN (SELECT backtest_id FROM paper_sessions)")
             connection.execute("DELETE FROM backtests WHERE candidate_id NOT IN (SELECT candidate_id FROM paper_sessions UNION SELECT candidate_id FROM approvals)")
             connection.execute("DELETE FROM research_sources WHERE session_id NOT IN (SELECT session_id FROM candidates WHERE id IN (SELECT candidate_id FROM paper_sessions UNION SELECT candidate_id FROM approvals))")
