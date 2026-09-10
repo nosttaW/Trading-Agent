@@ -19,7 +19,7 @@ def clean(monkeypatch):
 
 
 def verified_asset(symbol="TEST"):
-    return {"symbol": symbol, "name": "Test Common Stock", "exchange": "NASDAQ", "mic": "XNAS", "asset_class": "us_equity", "status": "active", "tradable": True, "halt_status": "not_halted", "ticker_resolution_count": 1, "quote_currency": "USD", "primary_venue": "NASDAQ", "consolidated_tape": True, "adr_status": "not_adr", "share_class_resolution": "verified_single_or_most_liquid", "security_type": "common_equity", "single_constituent_concentration": None, "corporate_actions_applied": "none in fixture"}
+    return {"symbol": symbol, "name": "Test Common Stock", "exchange": "NASDAQ", "mic": "XNAS", "asset_class": "us_equity", "status": "active", "tradable": True, "halt_status": "not_halted", "ticker_resolution_count": 1, "quote_currency": "USD", "primary_venue": "NASDAQ", "consolidated_tape": True, "adr_status": "not_adr", "share_class_resolution": "exact_listing", "security_type": "common_equity", "single_constituent_concentration": None, "corporate_actions_applied": "none in fixture"}
 
 
 def long_bars():
@@ -38,6 +38,13 @@ def test_strict_metadata_excludes_unverified_etf_and_share_class():
     equity = verified_asset("ABC"); equity["share_class_resolution"] = "unverified"
     assert "E4" in service.classify_asset(etf)
     assert "A3" in service.classify_asset(equity)
+
+
+def test_missing_separate_halt_flag_does_not_exclude_active_tradable_stock():
+    asset = verified_asset(); asset["halt_status"] = "not separately supplied; active/tradable checked"
+    assert service.classify_asset(asset) is None
+    asset["tradable"] = False
+    assert "C5" in service.classify_asset(asset)
 
 
 def test_holiday_gap_not_counted_as_intraday_missing_bar():

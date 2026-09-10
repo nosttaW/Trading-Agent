@@ -15,7 +15,7 @@ G3 also conflicts with the reviewed catalog: nine candidates comprise three stra
 
 ## Strict metadata
 
-Alpaca `data.alpaca.markets` supplies bars. Alpaca's read-only asset directory supplies symbol, active/tradable state, exchange, and name. It does not establish issuer identity/share-class liquidity, ADR sponsorship/underlying/FX, closed-end NAV schedule, or ETF constituent concentration. Strict mode excludes instruments whose required security type, halt status, or other metadata is unavailable. Frozen test/admin cache records can provide verified fields; production never infers them from performance data.
+Alpaca `data.alpaca.markets` supplies bars. Alpaca's read-only asset directory supplies symbol, current active/tradable state, exchange, and name. It does not supply a separate point-in-time halt flag or establish ADR sponsorship/underlying/FX, closed-end NAV schedule, or ETF constituent concentration. C5 therefore uses Alpaca's current active/tradable status and records the halt-field limitation instead of misclassifying missing data as a halt. Strict mode still excludes instruments whose security type or other required metadata cannot be established. Frozen test/admin cache records can provide verified fields; production never infers them from performance data.
 
 Accepted venues map to MICs: NYSE `XNYS`, Nasdaq `XNAS`, NYSE American `XASE`, NYSE Arca `ARCX`. Identifiers must be uppercase ASCII letters only. ETF concentration must be known and <=30%. ADR status must be verified. Share classes never merge.
 
@@ -29,7 +29,7 @@ A1–A4/E1–E5 metadata, then:
 2. 63-bar median volume >=500,000 shares/day and median dollar volume >=USD 20,000,000/day.
 3. Listing age >=750 completed daily bars.
 4. Development history >=500 completed daily bars.
-5. Active/tradable, not halted/restricted per latest frozen asset metadata.
+5. Active/tradable per latest frozen Alpaca asset metadata. A separate point-in-time halt flag is unavailable and disclosed.
 6. Exact uppercase ASCII ticker resolution.
 
 Funnel counts are cumulative. Weekends and cross-session gaps, including Labor Day 2026-09-07, are not intraday missing bars. No interpolation.

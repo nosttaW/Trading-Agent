@@ -731,8 +731,9 @@ def fetch_alpaca_assets(*, offline: bool = False) -> list[dict[str, Any]]:
         resolution_counts: dict[str, int] = {}
         for item in payload: resolution_counts[str(item.get("symbol", ""))] = resolution_counts.get(str(item.get("symbol", "")), 0) + 1
         for item in payload:
-            symbol = str(item.get("symbol", "")); exchange = str(item.get("exchange", "")); name = str(item.get("name", ""))
-            metadata = {"symbol": symbol, "name": name, "exchange": exchange, "mic": EXCHANGE_MIC.get(exchange), "asset_class": item.get("class"), "status": item.get("status"), "tradable": bool(item.get("tradable")), "marginable": bool(item.get("marginable")), "shortable": bool(item.get("shortable")), "easy_to_borrow": bool(item.get("easy_to_borrow")), "fractionable": bool(item.get("fractionable")), "attributes": item.get("attributes") or [], "quote_currency": "USD", "primary_venue": exchange, "consolidated_tape": True, "adr_status": "unverified", "share_class_resolution": "unverified", "ticker_resolution_count": resolution_counts[symbol], "halt_status": "unverified", "security_type": "unverified", "single_constituent_concentration": None, "corporate_actions_applied": "unavailable from bars endpoint; adjustment=all requested"}
+            symbol = str(item.get("symbol", "")); exchange = str(item.get("exchange", "")); name = str(item.get("name", "")); upper_name = name.upper()
+            is_common = any(marker in upper_name for marker in ("COMMON STOCK", "COMMON SHARES", "CAPITAL STOCK", "ORDINARY SHARES")); is_etf = " ETF" in upper_name or upper_name.endswith(" ETF")
+            metadata = {"symbol": symbol, "name": name, "exchange": exchange, "mic": EXCHANGE_MIC.get(exchange), "asset_class": item.get("class"), "status": item.get("status"), "tradable": bool(item.get("tradable")), "marginable": bool(item.get("marginable")), "shortable": bool(item.get("shortable")), "easy_to_borrow": bool(item.get("easy_to_borrow")), "fractionable": bool(item.get("fractionable")), "attributes": item.get("attributes") or [], "quote_currency": "USD", "primary_venue": exchange, "consolidated_tape": True, "adr_status": "unverified" if any(marker in upper_name for marker in (" ADR", "DEPOSITARY")) else "not_indicated_by_directory", "share_class_resolution": "exact_listing" if resolution_counts[symbol] == 1 else "unverified", "ticker_resolution_count": resolution_counts[symbol], "halt_status": "not separately supplied; active/tradable checked", "security_type": "ETF" if is_etf else "common_equity" if is_common else "unverified", "single_constituent_concentration": None, "corporate_actions_applied": "unavailable from bars endpoint; adjustment=all requested"}
             connection.execute("INSERT INTO universe_assets VALUES(?,?,?,?) ON CONFLICT(symbol) DO UPDATE SET metadata=excluded.metadata,metadata_hash=excluded.metadata_hash,retrieved_at=excluded.retrieved_at", (symbol, canonical(metadata), digest(metadata), iso()))
             assets.append(metadata)
     return assets
@@ -744,13 +745,12 @@ def classify_asset(asset: dict[str, Any]) -> str | None:
     if asset.get("ticker_resolution_count") != 1: return "C6 ticker does not resolve to exactly one listed instrument"
     if exchange not in EXCHANGE_MIC or not asset.get("mic"): return "A1/E1 exchange is outside accepted NYSE/Nasdaq/NYSE American metadata"
     if asset.get("quote_currency") != "USD": return "A2 quote currency is not USD"
-    if asset.get("status") != "active" or not asset.get("tradable"): return "E5/C5 inactive, restricted, or not intraday tradable"
-    if asset.get("halt_status") != "not_halted": return "E5 halt status at run date is unverified"
+    if asset.get("status") != "active" or not asset.get("tradable"): return "E5/C5 inactive, restricted, or not tradable per Alpaca asset status"
     if asset.get("security_type") not in {"ETF", "common_equity"}: return "A1 security type is unverified"
     if any(marker in f" {name} " for marker in LEVERAGED_MARKERS): return "E2 leveraged/inverse product name marker"
     if any(marker in name for marker in (" CLOSED-END", " CLOSED END", " UNIT TRUST")): return "E3 closed-end fund/unit trust"
     if asset.get("security_type") == "ETF" and asset.get("single_constituent_concentration") is None: return "E4 ETF concentration table unavailable; strict screen cannot verify <=30%"
-    if asset.get("security_type") != "ETF" and asset.get("share_class_resolution") == "unverified": return "A3 issuer/share-class liquidity resolution unavailable"
+    if asset.get("security_type") != "ETF" and asset.get("share_class_resolution") != "exact_listing": return "A3 exact listed share-class resolution unavailable"
     if asset.get("adr_status") == "unverified" and any(marker in name for marker in (" ADR", " DEPOSITARY")): return "A4/E1 ADR sponsorship and underlying/FX metadata unverified"
     return None
 
@@ -2378,7 +2378,7 @@ def create_universe_run(value: UniverseRunInput):
     spec = value.model_dump(mode="json")
     if value.dry_run: return {"dry_run": True, "specification": spec, "estimated_instruments": value.maximum_instruments, "maximum_candidate_tests": value.maximum_instruments * value.candidates, "database_touched": False}
     run_id, job_id, now = str(uuid.uuid4()), str(uuid.uuid4()), iso()
-    warnings = ["Research-only screen; no order path.", "IEX feed represents minority venue volume; volume-derived ranking is invalid and strict shortlist remains empty." if value.feed == "iex" else "SIP/delayed SIP entitlement requested; exact account entitlement and coverage are recorded.", "C1/C2 use holdout-date price/volume before ranking, compromising E3 independence; outputs must be unverified out-of-sample.", "G3 cannot be satisfied by the current reviewed catalog because variants differ only by bounded parameters."]
+    warnings = ["Research-only screen; no order path.", "IEX feed represents minority venue volume; volume-derived ranking is invalid and strict shortlist remains empty." if value.feed == "iex" else "SIP/delayed SIP entitlement requested; exact account entitlement and coverage are recorded.", "Alpaca asset metadata has no separate point-in-time halt flag; C5 uses current active/tradable status and records this limitation.", "C1/C2 use holdout-date price/volume before ranking, compromising E3 independence; outputs must be unverified out-of-sample.", "G3 cannot be satisfied by the current reviewed catalog because variants differ only by bounded parameters."]
     with connect() as connection:
         connection.execute("INSERT INTO universe_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (run_id, "PENDING", 0, canonical(spec), digest(spec), UNIVERSE_ENGINE_VERSION, UNIVERSE_ENGINE_HASH, value.seed, None, 0, None, None, canonical(warnings), "[]", "[]", None, 0, now, None, None))
         connection.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (job_id, "universe_screen", run_id, f"universe:{run_id}", "PENDING", now, None, None, 0, "{}", None, now, now))
