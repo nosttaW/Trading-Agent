@@ -1196,6 +1196,8 @@ def create_candidate(session_id: str) -> dict[str, Any]:
         families = [family for family in requested_families if family in compatible]
         if not families: raise HTTPException(422, f"No reviewed low-turnover template supports {config['timeframe']}")
         attempted = [(row["family"], variant_index_for(row["family"], json.loads(row["parameters"]))) for row in connection.execute("SELECT family,parameters FROM candidates WHERE session_id=? AND family IS NOT NULL", (session_id,)).fetchall()]
+        available = {(family, variant) for family in families for variant in range(len(TEMPLATES[family]["variants"]))}
+        if available <= set(attempted): return {"generated": False, "reason": f"All {len(available)} reviewed variants have been tested"}
         provider = connection.execute("SELECT * FROM providers WHERE id=?", (config.get("provider_id"),)).fetchone() if config.get("provider_id") else None
         sources = [dict(row) for row in connection.execute("SELECT url,title,published_at,retrieved_at,excerpt FROM research_sources WHERE session_id=? AND status='RETRIEVED'", (session_id,)).fetchall()]
         family = families[(ordinal - 1) % len(families)]
@@ -1487,9 +1489,11 @@ def run_backtests(session_id: str) -> None:
         completed = len(completed_rows); valid = connection.execute("SELECT COUNT(*) FROM candidates WHERE session_id=? AND status='VALID'", (session_id,)).fetchone()[0]; failed = connection.execute("SELECT COUNT(*) FROM backtests WHERE session_id=? AND status='FAILED'", (session_id,)).fetchone()[0]
         positive = any(json.loads(row["metrics"])["net_return_percent"] > 0 for row in completed_rows); started = datetime.fromisoformat(session["started_at"]) if session["started_at"] else utcnow(); exhausted = session["generation_count"] >= config["maximum_candidates"] or session["token_count"] >= config["token_budget"] or utcnow() >= started + timedelta(minutes=config["maximum_duration_minutes"])
         continuing = config.get("generation_mode") == "until_positive_return" and not positive and not exhausted
-        state = "GENERATING" if continuing else "FAILED" if not valid or not completed else "COMPLETED_WITH_ERRORS" if failed else "COMPLETED"
-        target_missed = config.get("generation_mode") == "until_positive_return" and exhausted and not positive
-        last_error = "No valid candidate produced a completed backtest" if state == "FAILED" else "Positive net-return target not reached before safety ceiling" if target_missed else None; next_run = (utcnow() + timedelta(minutes=config["generation_interval_minutes"])).isoformat() if continuing else None
+        compatible = {"1m": ["channel_breakout"], "5m": ["moving_average", "channel_breakout"], "15m": ["moving_average", "channel_breakout"], "1h": ["moving_average", "rsi", "channel_breakout"], "1d": ["moving_average", "rsi", "channel_breakout"]}[config["timeframe"]]
+        capacity = sum(len(TEMPLATES[family]["variants"]) for family in config["allowed_families"] if family in compatible); tested_variants = connection.execute("SELECT COUNT(DISTINCT normalized_hash) FROM candidates WHERE session_id=? AND family IS NOT NULL", (session_id,)).fetchone()[0]; catalog_exhausted = tested_variants >= capacity
+        continuing = continuing and not catalog_exhausted; state = "GENERATING" if continuing else "FAILED" if not valid or not completed else "COMPLETED_WITH_ERRORS" if failed else "COMPLETED"
+        target_missed = config.get("generation_mode") == "until_positive_return" and (exhausted or catalog_exhausted) and not positive
+        last_error = "No valid candidate produced a completed backtest" if state == "FAILED" else f"Positive net-return target not reached after all {capacity} reviewed variants" if target_missed and catalog_exhausted else "Positive net-return target not reached before safety ceiling" if target_missed else None; next_run = (utcnow() + timedelta(minutes=config["generation_interval_minutes"])).isoformat() if continuing else None
         connection.execute("UPDATE research_sessions SET state=?,next_run_at=?,stopped_at=?,last_error=? WHERE id=?", (state, next_run, None if continuing else iso(), last_error, session_id))
     audit("session.cycle_backtested" if continuing else "session.finalized", "research_session", session_id, {"state": state, "new_errors": errors, "positive_net_return_found": positive, "target_mode": config.get("generation_mode", "fixed_count")})
 
@@ -1513,7 +1517,7 @@ def process_due_sessions() -> int:
             continue
         try:
             result = create_candidate(session["id"])
-            if config.get("generation_mode") == "until_positive_return" and result.get("status") == "VALID": run_backtests(session["id"])
+            if not result.get("generated") or config.get("generation_mode") == "until_positive_return" and result.get("status") == "VALID": run_backtests(session["id"])
         finally:
             with connect() as connection:
                 connection.execute("UPDATE research_sessions SET in_flight=0 WHERE id=?", (session["id"],))
