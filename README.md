@@ -83,6 +83,10 @@ AI output is schema-validated. It may select one of three reviewed templates and
 
 Backtesting is a custom deterministic engine rather than a third-party library. Reason: required shared reviewed-template semantics, exact next-event timing, narrow initial scope, zero extra engine. Limit: not a general-purpose institutional simulator. Details: [`docs/strategy-interface.md`](docs/strategy-interface.md).
 
+## Stop-on-positive research mode
+
+Research sessions can use **Test each; stop when positive**. Each newly generated reviewed-template candidate is immediately backtested on the configured frozen historical period. Generation stops at the first `net_return_percent > 0` after configured costs, or at the existing candidate, duration, or token ceiling. Positive historical return is a search stopping condition only—not validation or evidence of future profit.
+
 ## Universe Screen
 
 The research-only Universe Screen applies strict US listing/metadata/liquidity/history filters, evaluates nine bounded reviewed variants, freezes development ranking before validator holdout processing, records multiple-testing diagnostics, and exports ASCII/JSON evidence. The requested reference-date screen conflicts with its sealed-holdout rule, so current strict runs correctly return an empty shortlist labelled unverified rather than fabricate a winner. See [docs/universe-screen.md](docs/universe-screen.md).

@@ -411,6 +411,33 @@ def test_continuous_generation_runs_one_candidate_per_cycle():
     assert finished["state"] == "COMPLETED"
 
 
+def test_until_positive_mode_backtests_each_candidate_and_stops(monkeypatch):
+    returns = iter([-1.0, 2.0])
+    original = service.backtest_candidate
+    def outcome(candidate, config, bars):
+        result = original(candidate, config, bars); result["metrics"]["net_return_percent"] = next(returns); return result
+    monkeypatch.setattr(service, "backtest_candidate", outcome)
+    created = client.post("/api/research-sessions", json=session_config(generation_interval_minutes=0, generation_mode="until_positive_return", maximum_candidates=5)).json()
+    started = client.post(f"/api/research-sessions/{created['id']}/start").json()
+    assert started["state"] == "GENERATING" and started["summary"]["completed_tests"] == 1
+    service.process_due_sessions(); finished = client.get(f"/api/research-sessions/{created['id']}").json()
+    assert finished["state"] == "COMPLETED" and finished["generation_count"] == 2
+    assert finished["summary"]["positive_return_target_met"] is True
+
+
+def test_until_positive_mode_stops_at_candidate_ceiling(monkeypatch):
+    original = service.backtest_candidate
+    def negative(candidate, config, bars):
+        result = original(candidate, config, bars); result["metrics"]["net_return_percent"] = -1.0; return result
+    monkeypatch.setattr(service, "backtest_candidate", negative)
+    created = client.post("/api/research-sessions", json=session_config(generation_interval_minutes=0, generation_mode="until_positive_return", maximum_candidates=2)).json()
+    client.post(f"/api/research-sessions/{created['id']}/start"); service.process_due_sessions()
+    finished = client.get(f"/api/research-sessions/{created['id']}").json()
+    assert finished["state"] == "COMPLETED" and finished["generation_count"] == 2
+    assert finished["summary"]["positive_return_target_met"] is False
+    assert "safety ceiling" in finished["last_error"]
+
+
 def test_sub_fifteen_minute_intervals_are_valid():
     for interval in (1, 5, 10):
         result = client.post("/api/research-sessions", json=session_config(generation_interval_minutes=interval))

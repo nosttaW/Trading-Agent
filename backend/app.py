@@ -298,6 +298,7 @@ class SessionConfig(BaseModel):
     token_budget: int = Field(default=20000, ge=1000, le=10_000_000)
     maximum_repair_attempts: int = Field(default=2, ge=0, le=5)
     generation_interval_minutes: int = Field(default=0, ge=0, le=1440)
+    generation_mode: Literal["fixed_count", "until_positive_return"] = "fixed_count"
     generate_immediately: bool = True
     web_research_enabled: bool = False
     web_research_query: str | None = Field(default=None, max_length=300)
@@ -1421,7 +1422,7 @@ def run_backtests(session_id: str) -> None:
             raise HTTPException(404, "Research session not found")
         config = json.loads(session["config"])
         connection.execute("UPDATE research_sessions SET state='BACKTESTING',next_run_at=NULL,in_flight=0 WHERE id=?", (session_id,))
-        candidates = connection.execute("SELECT * FROM candidates WHERE session_id=? ORDER BY ordinal", (session_id,)).fetchall()
+        candidates = connection.execute("SELECT c.* FROM candidates c WHERE c.session_id=? AND NOT EXISTS (SELECT 1 FROM backtests b WHERE b.candidate_id=c.id) ORDER BY c.ordinal", (session_id,)).fetchall()
     try:
         bars, feed = fetch_alpaca_bars(config["instruments"][0], config["timeframe"], config["historical_start"], config["historical_end"])
     except HTTPException as exc:
@@ -1454,12 +1455,15 @@ def run_backtests(session_id: str) -> None:
             with connect() as connection:
                 connection.execute("INSERT OR IGNORE INTO backtests(id,session_id,candidate_id,status,dataset_id,dataset_hash,engine_version,engine_hash,assumptions,metrics,equity_curve,drawdown_curve,trades,warnings,error,started_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (backtest_id, session_id, candidate["id"], "FAILED", dataset_id, dataset_hash, ENGINE_VERSION, ENGINE_HASH, canonical(assumptions), None, None, None, None, "[]", str(exc)[:500], iso(), iso()))
     with connect() as connection:
-        completed = connection.execute("SELECT COUNT(*) FROM backtests WHERE session_id=? AND status='COMPLETED'", (session_id,)).fetchone()[0]
-        valid = connection.execute("SELECT COUNT(*) FROM candidates WHERE session_id=? AND status='VALID'", (session_id,)).fetchone()[0]
-        state = "FAILED" if not valid or not completed else "COMPLETED_WITH_ERRORS" if errors else "COMPLETED"
-        last_error = "No valid candidate produced a completed backtest" if state == "FAILED" else None
-        connection.execute("UPDATE research_sessions SET state=?,stopped_at=?,last_error=COALESCE(last_error,?) WHERE id=?", (state, iso(), last_error, session_id))
-    audit("session.finalized", "research_session", session_id, {"state": state, "errors": errors})
+        session = connection.execute("SELECT * FROM research_sessions WHERE id=?", (session_id,)).fetchone(); completed_rows = connection.execute("SELECT metrics FROM backtests WHERE session_id=? AND status='COMPLETED'", (session_id,)).fetchall()
+        completed = len(completed_rows); valid = connection.execute("SELECT COUNT(*) FROM candidates WHERE session_id=? AND status='VALID'", (session_id,)).fetchone()[0]; failed = connection.execute("SELECT COUNT(*) FROM backtests WHERE session_id=? AND status='FAILED'", (session_id,)).fetchone()[0]
+        positive = any(json.loads(row["metrics"])["net_return_percent"] > 0 for row in completed_rows); started = datetime.fromisoformat(session["started_at"]) if session["started_at"] else utcnow(); exhausted = session["generation_count"] >= config["maximum_candidates"] or session["token_count"] >= config["token_budget"] or utcnow() >= started + timedelta(minutes=config["maximum_duration_minutes"])
+        continuing = config.get("generation_mode") == "until_positive_return" and not positive and not exhausted
+        state = "GENERATING" if continuing else "FAILED" if not valid or not completed else "COMPLETED_WITH_ERRORS" if failed else "COMPLETED"
+        target_missed = config.get("generation_mode") == "until_positive_return" and exhausted and not positive
+        last_error = "No valid candidate produced a completed backtest" if state == "FAILED" else "Positive net-return target not reached before safety ceiling" if target_missed else None; next_run = (utcnow() + timedelta(minutes=config["generation_interval_minutes"])).isoformat() if continuing else None
+        connection.execute("UPDATE research_sessions SET state=?,next_run_at=?,stopped_at=?,last_error=? WHERE id=?", (state, next_run, None if continuing else iso(), last_error, session_id))
+    audit("session.cycle_backtested" if continuing else "session.finalized", "research_session", session_id, {"state": state, "new_errors": errors, "positive_net_return_found": positive, "target_mode": config.get("generation_mode", "fixed_count")})
 
 
 def process_due_sessions() -> int:
@@ -1480,7 +1484,8 @@ def process_due_sessions() -> int:
         if not changed:
             continue
         try:
-            create_candidate(session["id"])
+            result = create_candidate(session["id"])
+            if config.get("generation_mode") == "until_positive_return" and result.get("status") == "VALID": run_backtests(session["id"])
         finally:
             with connect() as connection:
                 connection.execute("UPDATE research_sessions SET in_flight=0 WHERE id=?", (session["id"],))
@@ -2324,7 +2329,8 @@ def get_session(session_id: str):
     counts: dict[str, int] = {}
     for candidate in session["candidates"]:
         counts[candidate["status"]] = counts.get(candidate["status"], 0) + 1
-    session["summary"] = {"candidates_generated": len(candidates), "completed_tests": sum(item["status"] == "COMPLETED" for item in session["backtests"]), "failed_tests": sum(item["status"] == "FAILED" for item in session["backtests"]), **{key.lower(): value for key, value in counts.items()}}
+    completed_metrics = [item["metrics"] for item in session["backtests"] if item["status"] == "COMPLETED" and item.get("metrics")]
+    session["summary"] = {"candidates_generated": len(candidates), "completed_tests": len(completed_metrics), "failed_tests": sum(item["status"] == "FAILED" for item in session["backtests"]), "positive_return_target_met": any(item["net_return_percent"] > 0 for item in completed_metrics), "best_net_return_percent": max((item["net_return_percent"] for item in completed_metrics), default=None), **{key.lower(): value for key, value in counts.items()}}
     return session
 
 
