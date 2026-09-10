@@ -491,6 +491,12 @@ def test_invalidated_backtest_cleanup_stops_active_forward_test():
     assert client.delete(f"/api/strategies/{backtest['candidate_id']}").status_code == 200
 
 
+def test_archived_halted_paper_session_no_longer_blocks_strategy_archive(monkeypatch):
+    approved, _ = paper_ready(monkeypatch)
+    assert client.delete(f"/api/paper-sessions/{approved['id']}").status_code == 200
+    assert client.delete(f"/api/strategies/{approved['candidate_id']}").status_code == 200
+
+
 def test_strategy_delete_blocked_by_active_forward_test():
     completed = create_completed_session(); backtest = completed["backtests"][0]
     created = client.post("/api/live-tests", json={"backtest_id": backtest["id"], "entitlement": "delayed", "delay_minutes": 15, "confirmation": "Start Live Data Test"})

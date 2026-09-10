@@ -2184,7 +2184,7 @@ def archive_strategy(candidate_id: str):
         if candidate["archived_at"]:
             return {"archived": True, "candidate_id": candidate_id}
         live = connection.execute("SELECT id,state FROM live_tests WHERE candidate_id=? AND state NOT IN ('STOPPED','EXPIRED')", (candidate_id,)).fetchone()
-        paper = connection.execute("SELECT id,state FROM paper_sessions WHERE candidate_id=? AND state NOT IN ('STOPPED','EXPIRED')", (candidate_id,)).fetchone()
+        paper = connection.execute("SELECT id,state FROM paper_sessions WHERE candidate_id=? AND archived_at IS NULL AND state NOT IN ('STOPPED','EXPIRED')", (candidate_id,)).fetchone()
         if live or paper:
             blockers = [f"Live Data Test {live['id'][:8]} ({live['state']})"] if live else []
             if paper: blockers.append(f"Paper session {paper['id'][:8]} ({paper['state']})")
