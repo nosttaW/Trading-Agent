@@ -152,6 +152,10 @@ def init_db() -> None:
             connection.execute("UPDATE candidates SET archived_at=COALESCE(archived_at,?)", (now,))
             connection.execute("DELETE FROM market_datasets WHERE id NOT IN (SELECT dataset_id FROM backtests)")
             connection.execute("INSERT INTO app_metadata(key,value) VALUES('unified_evidence_v1_research_purged',?)", (canonical({"at": now, "protected_candidates_archived": len(protected)}),))
+        unified_evidence_cleanup = connection.execute("SELECT value FROM app_metadata WHERE key='unified_evidence_v1_cleanup_v2'").fetchone()
+        if not unified_evidence_cleanup:
+            connection.execute("DELETE FROM live_tests")
+            connection.execute("INSERT INTO app_metadata(key,value) VALUES('unified_evidence_v1_cleanup_v2',?)", (iso(),))
         stable_hash_migration = connection.execute("SELECT value FROM app_metadata WHERE key='stable_paper_engine_hash_v1'").fetchone()
         if not stable_hash_migration:
             # Existing approvals used an app-wide hash. Only the known audited compatible release is rebound.
@@ -2310,7 +2314,7 @@ def test_alpaca_connection(mode: Literal["data", "paper", "live"]):
 @app.get("/api/research-sessions")
 def list_sessions():
     with connect() as connection:
-        rows = connection.execute("SELECT * FROM research_sessions ORDER BY created_at DESC").fetchall()
+        rows = connection.execute("SELECT * FROM research_sessions r WHERE NOT EXISTS (SELECT 1 FROM candidates c WHERE c.session_id=r.id) OR EXISTS (SELECT 1 FROM candidates c WHERE c.session_id=r.id AND c.archived_at IS NULL) ORDER BY created_at DESC").fetchall()
     return [json_row(row, ("config",)) for row in rows]
 
 
