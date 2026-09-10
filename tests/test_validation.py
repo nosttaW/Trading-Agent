@@ -14,7 +14,7 @@ def clean_validation_database(monkeypatch):
     service.init_db(); service.LOGIN_FAILURES.clear()
     monkeypatch.setattr(service, "alpaca_data_connection", lambda: True)
     monkeypatch.setattr(service, "validate_alpaca_equity_symbol", lambda _: None)
-    monkeypatch.setattr(service, "fetch_alpaca_bars", lambda *args: (service.demo_bars(args[1]), "iex"))
+    monkeypatch.setattr(service, "fetch_alpaca_bars", lambda *args: (base.recent_demo_bars(args[1]), "iex"))
     login = client.post("/api/auth/login", json={"password": "correct horse battery staple"}); client.headers["x-csrf-token"] = login.json()["csrf_token"]
     yield
     if base.TEST_DB.exists(): base.TEST_DB.unlink()

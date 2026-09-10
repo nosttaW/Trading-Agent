@@ -19,6 +19,22 @@ os.environ["ADMIN_PASSWORD_HASH"] = service.password_hash("correct horse battery
 client = TestClient(service.app)
 
 
+def recent_demo_bars(timeframe="1d"):
+    bars = service.demo_bars(timeframe)
+    if timeframe != "1d":
+        first = datetime.now(UTC) - service.timedelta(days=400); expanded = []
+        while first.weekday() >= 5: first += service.timedelta(days=1)
+        per_day = {"1m": 390, "5m": 78, "15m": 26, "1h": 7}[timeframe]; step = service.timedelta(minutes=service.TIMEFRAME_MINUTES[timeframe])
+        for day in range(401):
+            at = first + service.timedelta(days=day)
+            if at.weekday() >= 5: continue
+            at = at.replace(hour=14, minute=30)
+            for index in range(per_day): expanded.append({**bars[len(expanded) % len(bars)], "timestamp": (at + index * step).isoformat()})
+        return expanded
+    shift = datetime.now(UTC) - service.timedelta(days=1) - datetime.fromisoformat(bars[-1]["timestamp"])
+    return [{**bar, "timestamp": (datetime.fromisoformat(bar["timestamp"]) + shift).isoformat()} for bar in bars]
+
+
 @pytest.fixture(autouse=True)
 def clean_database(monkeypatch):
     if TEST_DB.exists():
@@ -27,7 +43,7 @@ def clean_database(monkeypatch):
     service.LOGIN_FAILURES.clear()
     monkeypatch.setattr(service, "alpaca_data_connection", lambda: True)
     monkeypatch.setattr(service, "validate_alpaca_equity_symbol", lambda instrument: None)
-    monkeypatch.setattr(service, "fetch_alpaca_bars", lambda *args: (service.demo_bars(args[1]), "iex"))
+    monkeypatch.setattr(service, "fetch_alpaca_bars", lambda *args: (recent_demo_bars(args[1]), "iex"))
     login = client.post("/api/auth/login", json={"password": "correct horse battery staple"})
     assert login.status_code == 200
     client.headers["x-csrf-token"] = login.json()["csrf_token"]
@@ -52,7 +68,7 @@ def create_completed_session(monkeypatch=None):
     if monkeypatch:
         monkeypatch.setattr(service, "alpaca_data_connection", lambda: True)
         monkeypatch.setattr(service, "validate_alpaca_equity_symbol", lambda instrument: None)
-        monkeypatch.setattr(service, "fetch_alpaca_bars", lambda *args: (service.demo_bars(args[1]), "iex"))
+        monkeypatch.setattr(service, "fetch_alpaca_bars", lambda *args: (recent_demo_bars(args[1]), "iex"))
     created = client.post("/api/research-sessions", json=session_config()).json()
     started = client.post(f"/api/research-sessions/{created['id']}/start").json()
     assert started["state"] == "GENERATING"
@@ -414,8 +430,8 @@ def test_continuous_generation_runs_one_candidate_per_cycle():
 def test_until_positive_mode_backtests_each_candidate_and_stops(monkeypatch):
     returns = iter([-1.0, 2.0])
     original = service.backtest_candidate
-    def outcome(candidate, config, bars):
-        result = original(candidate, config, bars); result["metrics"]["net_return_percent"] = next(returns); return result
+    def outcome(candidate, config, bars, score_start=0):
+        result = original(candidate, config, bars, score_start); result["metrics"]["net_return_percent"] = next(returns); return result
     monkeypatch.setattr(service, "backtest_candidate", outcome)
     created = client.post("/api/research-sessions", json=session_config(generation_interval_minutes=0, generation_mode="until_positive_return", maximum_candidates=5)).json()
     started = client.post(f"/api/research-sessions/{created['id']}/start").json()
@@ -427,8 +443,8 @@ def test_until_positive_mode_backtests_each_candidate_and_stops(monkeypatch):
 
 def test_until_positive_mode_stops_at_candidate_ceiling(monkeypatch):
     original = service.backtest_candidate
-    def negative(candidate, config, bars):
-        result = original(candidate, config, bars); result["metrics"]["net_return_percent"] = -1.0; return result
+    def negative(candidate, config, bars, score_start=0):
+        result = original(candidate, config, bars, score_start); result["metrics"]["net_return_percent"] = -1.0; return result
     monkeypatch.setattr(service, "backtest_candidate", negative)
     created = client.post("/api/research-sessions", json=session_config(generation_interval_minutes=0, generation_mode="until_positive_return", maximum_candidates=2)).json()
     client.post(f"/api/research-sessions/{created['id']}/start"); service.process_due_sessions()
@@ -481,7 +497,12 @@ def test_stop_backtests_every_valid_candidate():
     result = completed["backtests"][0]
     assert result["status"] == "COMPLETED"
     assert result["metrics"]["trade_count"] >= 0
-    assert len(result["equity_curve"]) == 620
+    assert result["assumptions"]["requested_calendar_days"] == 365
+    assert 250 <= len(result["equity_curve"]) <= 270
+    assert completed["summary"]["completed_tests"] == 1
+    linked = client.get(f"/api/backtests/{result['id']}").json()
+    assert linked["validation_state"] == "COMPLETED"
+    assert linked["validation_result"]["period"] == {"start": result["assumptions"]["historical_start"], "end": result["assumptions"]["historical_end"]}
 
 
 def test_duplicate_attempt_is_retained():
@@ -534,12 +555,12 @@ def test_strategy_delete_blocked_by_active_forward_test():
 
 def test_backtest_fill_is_after_signal_bar():
     completed = create_completed_session()
-    backtest = completed["backtests"][0]
-    bars = service.demo_bars()
-    timestamps = [bar["timestamp"] for bar in bars]
+    backtest = client.get(f"/api/backtests/{completed['backtests'][0]['id']}").json()
+    timestamps = [point["at"] for point in backtest["validation_result"]["symbols"][0]["base"]["equity_curve"]]
+    timestamp_days = {value[:10] for value in timestamps}
     for trade in backtest["trades"]:
-        assert trade["entry_time"] in timestamps
-        assert timestamps.index(trade["entry_time"]) >= 1
+        assert trade["entry_time"][:10] in timestamp_days
+        assert sorted(timestamp_days).index(trade["entry_time"][:10]) >= 1
 
 
 def test_live_worker_warms_without_orders_then_processes_new_bar(monkeypatch):
@@ -626,6 +647,7 @@ def test_instrument_and_timeframe_are_configurable_and_frozen():
     assert created["config"]["timeframe"] == "15m"
     client.post(f"/api/research-sessions/{created['id']}/start")
     completed = client.post(f"/api/research-sessions/{created['id']}/control", json={"action": "stop"}).json()
+    assert completed["backtests"], completed.get("last_error")
     result = completed["backtests"][0]
     assert result["assumptions"]["instruments"] == ["AAPL"]
     assert result["assumptions"]["timeframe"] == "15m"

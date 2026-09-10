@@ -91,7 +91,11 @@ Research sessions can use **Test each; stop when positive**. Each newly generate
 
 The research-only Universe Screen applies strict US listing/metadata/liquidity/history filters, evaluates nine bounded reviewed variants, freezes development ranking before validator holdout processing, records multiple-testing diagnostics, and exports ASCII/JSON evidence. The requested reference-date screen conflicts with its sealed-holdout rule, so current strict runs correctly return an empty shortlist labelled unverified rather than fabricate a winner. See [docs/universe-screen.md](docs/universe-screen.md).
 
-## Strategy Validation
+## Unified Evidence
+
+Backtesting and strategy validation share one **Evidence** workflow. Every completed strategy uses trailing 365-calendar-day Alpaca data, excludes pre-period indicator warm-up from scoring, then automatically runs robustness checks against the same frozen strategy and recent period. Missing coverage fails closed. See [docs/validation.md](docs/validation.md).
+
+## Strategy Validation (legacy API)
 
 Dedicated validation runs evaluate frozen reviewed strategies on recent completed Alpaca data. Recent 30/90/180/365-day or custom periods, immutable dataset fingerprints, period-use/holdout access provenance, fixed-parameter rolling/expanding walk-forward windows, realistic cost/delay stress, nearby-parameter sensitivity, robust metrics, seeded moving-block bootstrap intervals, concentration/regimes, frozen criteria, progress/cancellation, saved comparisons, and JSON/CSV export are implemented. See [docs/validation.md](docs/validation.md) for setup, definitions, assumptions, examples, and limitations. Validation never proves future profitability.
 

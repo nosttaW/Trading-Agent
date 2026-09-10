@@ -136,6 +136,21 @@ def init_db() -> None:
         for column, definition in (("automation_enabled", "INTEGER NOT NULL DEFAULT 0"), ("automation_state", "TEXT NOT NULL DEFAULT 'DISABLED'"), ("automation_runtime", "TEXT NOT NULL DEFAULT '{}'"), ("automation_logs", "TEXT NOT NULL DEFAULT '[]'"), ("archived_at", "TEXT")):
             if column not in paper_columns:
                 connection.execute(f"ALTER TABLE paper_sessions ADD COLUMN {column} {definition}")
+        unified_evidence_purge = connection.execute("SELECT value FROM app_metadata WHERE key='unified_evidence_v1_research_purged'").fetchone()
+        if not unified_evidence_purge:
+            now = iso(); protected = {row[0] for row in connection.execute("SELECT candidate_id FROM paper_sessions UNION SELECT candidate_id FROM approvals").fetchall()}
+            connection.execute("UPDATE paper_sessions SET automation_enabled=0,automation_state='DISABLED' WHERE automation_enabled=1")
+            connection.execute("DELETE FROM jobs WHERE kind IN ('strategy_validation','research_generation')")
+            connection.execute("DELETE FROM strategy_period_uses WHERE candidate_id NOT IN (SELECT candidate_id FROM paper_sessions UNION SELECT candidate_id FROM approvals)")
+            connection.execute("DELETE FROM validation_runs WHERE candidate_id NOT IN (SELECT candidate_id FROM paper_sessions UNION SELECT candidate_id FROM approvals)")
+            connection.execute("DELETE FROM strategy_reviews WHERE backtest_id NOT IN (SELECT backtest_id FROM paper_sessions)")
+            connection.execute("DELETE FROM backtests WHERE candidate_id NOT IN (SELECT candidate_id FROM paper_sessions UNION SELECT candidate_id FROM approvals)")
+            connection.execute("DELETE FROM research_sources WHERE session_id NOT IN (SELECT session_id FROM candidates WHERE id IN (SELECT candidate_id FROM paper_sessions UNION SELECT candidate_id FROM approvals))")
+            connection.execute("DELETE FROM candidates WHERE id NOT IN (SELECT candidate_id FROM paper_sessions UNION SELECT candidate_id FROM approvals)")
+            connection.execute("DELETE FROM research_sessions WHERE id NOT IN (SELECT session_id FROM candidates)")
+            connection.execute("UPDATE candidates SET archived_at=COALESCE(archived_at,?)", (now,))
+            connection.execute("DELETE FROM market_datasets WHERE id NOT IN (SELECT dataset_id FROM backtests)")
+            connection.execute("INSERT INTO app_metadata(key,value) VALUES('unified_evidence_v1_research_purged',?)", (canonical({"at": now, "protected_candidates_archived": len(protected)}),))
         stable_hash_migration = connection.execute("SELECT value FROM app_metadata WHERE key='stable_paper_engine_hash_v1'").fetchone()
         if not stable_hash_migration:
             # Existing approvals used an app-wide hash. Only the known audited compatible release is rebound.
@@ -1411,8 +1426,8 @@ def evaluate_strategy(candidate: sqlite3.Row | dict[str, Any], config: dict[str,
     return {"metrics": metrics, "equity_curve": [{"at": at, "value": round(float(value), 2)} for at, value in zip(equity_times, equity)], "drawdown_curve": [round(float(value / max(equity[:i + 1]) - 1) * 100, 2) for i, value in enumerate(equity)], "trades": trades, "returns": returns, "regimes": regime_results(bars[score_start:score_end], returns), "warnings": ["Signals use completed bars; fills occur no earlier than the configured later bar open.", "Fees, half-spread, and slippage are modeled once per side.", "Regular-hours calendar excludes extended hours; early-close/unscheduled closure detection is unsupported without an exchange-calendar provider.", "Liquidity, partial fills, queue position, market impact, and intrabar paths are unsupported."]}
 
 
-def backtest_candidate(candidate: sqlite3.Row, config: dict[str, Any], bars: list[dict[str, Any]]) -> dict[str, Any]:
-    result = evaluate_strategy(candidate, config, bars, seed=7)
+def backtest_candidate(candidate: sqlite3.Row, config: dict[str, Any], bars: list[dict[str, Any]], score_start: int = 0) -> dict[str, Any]:
+    result = evaluate_strategy(candidate, config, bars, score_start=score_start, seed=7)
     return {"metrics": result["metrics"], "equity_curve": [point["value"] for point in result["equity_curve"]], "drawdown_curve": result["drawdown_curve"], "trades": result["trades"], "warnings": ["Alpaca historical bars; provider feed, retrieval time, and content hash are frozen with this result.", *result["warnings"], "Final holdout requires a separate Strategy Validation run.", "Multiple testing can inflate apparent performance."]}
 
 def run_backtests(session_id: str) -> None:
@@ -1423,37 +1438,45 @@ def run_backtests(session_id: str) -> None:
         config = json.loads(session["config"])
         connection.execute("UPDATE research_sessions SET state='BACKTESTING',next_run_at=NULL,in_flight=0 WHERE id=?", (session_id,))
         candidates = connection.execute("SELECT c.* FROM candidates c WHERE c.session_id=? AND NOT EXISTS (SELECT 1 FROM backtests b WHERE b.candidate_id=c.id) ORDER BY c.ordinal", (session_id,)).fetchall()
+    end_date = utcnow().date(); recent_start = end_date - timedelta(days=365); per_day = {"1m": 390, "5m": 78, "15m": 26, "1h": 7, "1d": 1}[config["timeframe"]]
+    lookback_bars = max((max(json.loads(candidate["parameters"]).values()) for candidate in candidates if candidate["status"] == "VALID"), default=1); warmup_days = max(14, math.ceil(lookback_bars / per_day * 7 / 5) + 14); fetch_start = recent_start - timedelta(days=warmup_days)
     try:
-        bars, feed = fetch_alpaca_bars(config["instruments"][0], config["timeframe"], config["historical_start"], config["historical_end"])
+        bars, feed = fetch_alpaca_bars(config["instruments"][0], config["timeframe"], fetch_start.isoformat(), end_date.isoformat()); bars = completed_bars(bars, config["timeframe"], utcnow())
+        score_start = next((index for index, bar in enumerate(bars) if datetime.fromisoformat(bar["timestamp"].replace("Z", "+00:00")).date() >= recent_start), len(bars))
+        if score_start >= len(bars) - 1 or datetime.fromisoformat(bars[score_start]["timestamp"].replace("Z", "+00:00")).date() > recent_start + timedelta(days=7): raise HTTPException(422, "Alpaca did not return a complete trailing 365-calendar-day scored period")
     except HTTPException as exc:
         with connect() as connection:
             connection.execute("UPDATE research_sessions SET state='FAILED',stopped_at=?,last_error=? WHERE id=?", (iso(), str(exc.detail), session_id))
         audit("session.failed", "research_session", session_id, {"error": str(exc.detail)})
         return
     dataset_hash = digest(bars)
-    dataset_id = f"{DATASET_ID}-{config['instruments'][0]}-{config['timeframe']}-{dataset_hash[:12]}"
+    scored_end = datetime.fromisoformat(bars[-1]["timestamp"].replace("Z", "+00:00")).date().isoformat(); dataset_id = f"{DATASET_ID}-{config['instruments'][0]}-{config['timeframe']}-{dataset_hash[:12]}"
     with connect() as connection:
-        connection.execute("INSERT OR IGNORE INTO market_datasets VALUES(?,?,?,?,?,?,?,?,?,?)", (dataset_id, "alpaca", config["instruments"][0], config["timeframe"], config["historical_start"], config["historical_end"], feed, canonical(bars), dataset_hash, iso()))
-    errors = 0
+        connection.execute("INSERT OR IGNORE INTO market_datasets VALUES(?,?,?,?,?,?,?,?,?,?)", (dataset_id, "alpaca", config["instruments"][0], config["timeframe"], fetch_start.isoformat(), end_date.isoformat(), feed, canonical(bars), dataset_hash, iso()))
+    errors = 0; completed_backtest_ids = []
     for candidate in candidates:
         if candidate["status"] != "VALID":
             continue
         backtest_id = str(uuid.uuid4())
-        assumptions = {key: config[key] for key in ("instruments", "timeframe", "starting_capital", "fee_bps", "spread_bps", "slippage_bps", "historical_start", "historical_end", "development_percent", "validation_percent", "holdout_percent")}
+        assumptions = {key: config[key] for key in ("instruments", "timeframe", "starting_capital", "fee_bps", "spread_bps", "slippage_bps", "development_percent", "validation_percent", "holdout_percent")}; assumptions.update({"historical_start": recent_start.isoformat(), "historical_end": scored_end, "requested_calendar_days": 365, "fetch_start_with_warmup": fetch_start.isoformat(), "scored_bars": len(bars) - score_start})
         assumptions["data_provider"], assumptions["data_feed"], assumptions["retrieved_at"] = "alpaca", feed, iso()
         assumptions["session_policy"] = "regular_hours_flatten_daily" if config["timeframe"] != "1d" else "daily_bars"
         try:
-            result = backtest_candidate(candidate, config, bars)
+            result = backtest_candidate(candidate, config, bars, score_start)
             with connect() as connection:
                 connection.execute(
                     "INSERT OR IGNORE INTO backtests(id,session_id,candidate_id,status,dataset_id,dataset_hash,engine_version,engine_hash,assumptions,metrics,equity_curve,drawdown_curve,trades,warnings,error,started_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (backtest_id, session_id, candidate["id"], "COMPLETED", dataset_id, dataset_hash, ENGINE_VERSION, ENGINE_HASH, canonical(assumptions), canonical(result["metrics"]), canonical(result["equity_curve"]), canonical(result["drawdown_curve"]), canonical(result["trades"]), canonical(result["warnings"]), None, iso(), iso()),
                 )
-            audit("backtest.completed", "backtest", backtest_id, {"candidate_id": candidate["id"], "dataset": dataset_id, "instrument": config["instruments"][0], "timeframe": config["timeframe"]})
+            completed_backtest_ids.append(backtest_id); audit("backtest.completed", "backtest", backtest_id, {"candidate_id": candidate["id"], "dataset": dataset_id, "instrument": config["instruments"][0], "timeframe": config["timeframe"], "recent_calendar_days": 365})
         except Exception as exc:
             errors += 1
             with connect() as connection:
                 connection.execute("INSERT OR IGNORE INTO backtests(id,session_id,candidate_id,status,dataset_id,dataset_hash,engine_version,engine_hash,assumptions,metrics,equity_curve,drawdown_curve,trades,warnings,error,started_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (backtest_id, session_id, candidate["id"], "FAILED", dataset_id, dataset_hash, ENGINE_VERSION, ENGINE_HASH, canonical(assumptions), None, None, None, None, "[]", str(exc)[:500], iso(), iso()))
+    for backtest_id in completed_backtest_ids:
+        validation = create_validation(ValidationRunInput(backtest_id=backtest_id, symbols=config["instruments"], timeframe=config["timeframe"], period_preset="custom", start_date=recent_start.isoformat(), end_date=scored_end, fee_bps=config["fee_bps"], spread_bps=config["spread_bps"], slippage_bps=config["slippage_bps"], minimum_trades=config["minimum_trade_count"], maximum_drawdown_percent=config["max_drawdown_percent"]))
+        process_validation_run(validation["id"])
+        with connect() as connection: connection.execute("UPDATE jobs SET state=(SELECT state FROM validation_runs WHERE id=?),updated_at=? WHERE resource_id=? AND kind='strategy_validation'", (validation["id"], iso(), validation["id"]))
     with connect() as connection:
         session = connection.execute("SELECT * FROM research_sessions WHERE id=?", (session_id,)).fetchone(); completed_rows = connection.execute("SELECT metrics FROM backtests WHERE session_id=? AND status='COMPLETED'", (session_id,)).fetchall()
         completed = len(completed_rows); valid = connection.execute("SELECT COUNT(*) FROM candidates WHERE session_id=? AND status='VALID'", (session_id,)).fetchone()[0]; failed = connection.execute("SELECT COUNT(*) FROM backtests WHERE session_id=? AND status='FAILED'", (session_id,)).fetchone()[0]
@@ -2499,7 +2522,7 @@ def export_validation(run_id: str, format: Literal["json", "csv"] = "json"):
 
 @app.get("/api/backtests")
 def list_backtests(session_id: str | None = None):
-    query = "SELECT b.*,c.name,c.family,c.source,c.source_hash,c.parameters,c.hypothesis,c.dependency_manifest FROM backtests b JOIN candidates c ON c.id=b.candidate_id WHERE c.archived_at IS NULL"
+    query = "SELECT b.*,c.name,c.family,c.source,c.source_hash,c.parameters,c.hypothesis,c.dependency_manifest,v.id AS validation_id,v.state AS validation_state,v.progress AS validation_progress,v.result AS validation_result,v.warnings AS validation_warnings,v.error AS validation_error FROM backtests b JOIN candidates c ON c.id=b.candidate_id LEFT JOIN validation_runs v ON v.id=(SELECT id FROM validation_runs WHERE backtest_id=b.id ORDER BY created_at DESC LIMIT 1) WHERE c.archived_at IS NULL"
     params: tuple[Any, ...] = ()
     if session_id:
         query += " AND b.session_id=?"
@@ -2507,7 +2530,7 @@ def list_backtests(session_id: str | None = None):
     query += " ORDER BY b.completed_at DESC"
     with connect() as connection:
         rows = connection.execute(query, params).fetchall()
-    return [json_row(row, ("assumptions", "metrics", "equity_curve", "drawdown_curve", "trades", "warnings", "parameters", "dependency_manifest")) for row in rows]
+    return [json_row(row, ("assumptions", "metrics", "equity_curve", "drawdown_curve", "trades", "warnings", "parameters", "dependency_manifest", "validation_result", "validation_warnings")) for row in rows]
 
 
 @app.delete("/api/strategies/{candidate_id}")
@@ -2533,10 +2556,10 @@ def archive_strategy(candidate_id: str):
 @app.get("/api/backtests/{backtest_id}")
 def get_backtest(backtest_id: str):
     with connect() as connection:
-        row = connection.execute("SELECT b.*,c.name,c.family,c.source,c.source_hash,c.parameters,c.hypothesis,c.dependency_manifest,c.prompt_version,c.created_at AS generated_at FROM backtests b JOIN candidates c ON c.id=b.candidate_id WHERE b.id=?", (backtest_id,)).fetchone()
+        row = connection.execute("SELECT b.*,c.name,c.family,c.source,c.source_hash,c.parameters,c.hypothesis,c.dependency_manifest,c.prompt_version,c.created_at AS generated_at,v.id AS validation_id,v.state AS validation_state,v.progress AS validation_progress,v.result AS validation_result,v.warnings AS validation_warnings,v.error AS validation_error FROM backtests b JOIN candidates c ON c.id=b.candidate_id LEFT JOIN validation_runs v ON v.id=(SELECT id FROM validation_runs WHERE backtest_id=b.id ORDER BY created_at DESC LIMIT 1) WHERE b.id=?", (backtest_id,)).fetchone()
     if not row:
         raise HTTPException(404, "Backtest not found")
-    return json_row(row, ("assumptions", "metrics", "equity_curve", "drawdown_curve", "trades", "warnings", "parameters", "dependency_manifest"))
+    return json_row(row, ("assumptions", "metrics", "equity_curve", "drawdown_curve", "trades", "warnings", "parameters", "dependency_manifest", "validation_result", "validation_warnings"))
 
 
 @app.get("/api/backtests/{backtest_id}/reviews")

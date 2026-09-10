@@ -1,4 +1,11 @@
-# Strategy Validation
+# Unified Strategy Evidence
+
+Every newly completed strategy now receives one unified evidence workflow. The historical backtest and robustness validation appear together under **Evidence**. Separate manual validation is no longer part of the normal UI.
+
+The scored backtest period is always the trailing 365 calendar days ending at the latest request date, yielding roughly 252 daily observations for `1d`. Indicator warm-up is fetched before that period and excluded from scored metrics. Missing recent coverage fails closed. Immediately after backtesting, the server automatically runs the existing cost stress, parameter sensitivity, delay, bootstrap, criteria, and provenance checks against the same frozen strategy and recent period.
+
+This reuse of one recent period is convenient, not an independent holdout. Repeated strategy search against it increases selection bias. Positive net return remains descriptive research evidence only.
+
 
 Strategy Validation asks whether a frozen reviewed strategy retains useful performance on recent data not known to have been used for development. It does **not** prove future profitability.
 
