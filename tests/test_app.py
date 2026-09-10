@@ -512,11 +512,11 @@ def test_reviewed_catalog_exhaustion_stops_without_duplicate_or_invalid_attempts
     monkeypatch.setattr(service, "backtest_candidate", negative)
     created = client.post("/api/research-sessions", json=session_config(allowed_families=["moving_average"], generation_interval_minutes=0, generation_mode="until_positive_return", maximum_candidates=100)).json()
     client.post(f"/api/research-sessions/{created['id']}/start")
-    service.process_due_sessions(); service.process_due_sessions()
+    for _ in range(6): service.process_due_sessions()
     session = client.get(f"/api/research-sessions/{created['id']}").json()
-    assert session["state"] == "COMPLETED" and len(session["candidates"]) == 3
+    assert session["state"] == "COMPLETED" and len(session["candidates"]) == 6
     assert all(item["status"] == "VALID" for item in session["candidates"])
-    assert "all 3 reviewed variants" in session["last_error"]
+    assert "all 6 reviewed variants" in session["last_error"]
 
 
 def test_strategy_delete_archives_but_preserves_history():
