@@ -122,6 +122,11 @@ def init_db() -> None:
         if not validation_engine_migration:
             connection.execute("UPDATE backtests SET invalidated_at=COALESCE(invalidated_at,?),invalidation_reason=COALESCE(invalidation_reason,'Superseded by shared validation engine with scored-window warm-up, costed benchmark, and robust metric semantics') WHERE status='COMPLETED'", (iso(),))
             connection.execute("INSERT INTO app_metadata(key,value) VALUES('validation_engine_v1_backtests_invalidated',?)", (iso(),))
+        invalidated_execution_cleanup = connection.execute("SELECT value FROM app_metadata WHERE key='invalidated_execution_cleanup_v1'").fetchone()
+        if not invalidated_execution_cleanup:
+            connection.execute("UPDATE live_tests SET state='STOPPED',paused_entries=1,logs=json_insert(logs,'$[#]',json_object('at',?,'level','error','message','Stopped automatically: source backtest evidence was invalidated.')) WHERE backtest_id IN (SELECT id FROM backtests WHERE invalidated_at IS NOT NULL) AND state NOT IN ('STOPPED','EXPIRED')", (iso(),))
+            connection.execute("UPDATE paper_sessions SET state='HALTED',emergency_stop=1,automation_enabled=0,automation_state='EVIDENCE_INVALIDATED' WHERE backtest_id IN (SELECT id FROM backtests WHERE invalidated_at IS NOT NULL) AND state NOT IN ('STOPPED','EXPIRED')")
+            connection.execute("INSERT INTO app_metadata(key,value) VALUES('invalidated_execution_cleanup_v1',?)", (iso(),))
         live_columns = {row[1] for row in connection.execute("PRAGMA table_info(live_tests)").fetchall()}
         if "runtime_state" not in live_columns:
             connection.execute("ALTER TABLE live_tests ADD COLUMN runtime_state TEXT NOT NULL DEFAULT '{}'")
@@ -2178,10 +2183,12 @@ def archive_strategy(candidate_id: str):
             raise HTTPException(404, "Strategy not found")
         if candidate["archived_at"]:
             return {"archived": True, "candidate_id": candidate_id}
-        live = connection.execute("SELECT id FROM live_tests WHERE candidate_id=? AND state NOT IN ('STOPPED','EXPIRED')", (candidate_id,)).fetchone()
-        paper = connection.execute("SELECT id FROM paper_sessions WHERE candidate_id=? AND state NOT IN ('STOPPED','EXPIRED')", (candidate_id,)).fetchone()
+        live = connection.execute("SELECT id,state FROM live_tests WHERE candidate_id=? AND state NOT IN ('STOPPED','EXPIRED')", (candidate_id,)).fetchone()
+        paper = connection.execute("SELECT id,state FROM paper_sessions WHERE candidate_id=? AND state NOT IN ('STOPPED','EXPIRED')", (candidate_id,)).fetchone()
         if live or paper:
-            raise HTTPException(409, "Stop active live-data and broker-paper sessions before deleting this strategy")
+            blockers = [f"Live Data Test {live['id'][:8]} ({live['state']})"] if live else []
+            if paper: blockers.append(f"Paper session {paper['id'][:8]} ({paper['state']})")
+            raise HTTPException(409, "Stop these sessions before deleting the strategy: " + ", ".join(blockers))
         archived_at = iso()
         connection.execute("UPDATE candidates SET archived_at=? WHERE id=?", (archived_at, candidate_id))
     audit("strategy.archived", "candidate", candidate_id, {"name": candidate["name"], "archived_at": archived_at})

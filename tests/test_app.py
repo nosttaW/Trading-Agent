@@ -480,6 +480,17 @@ def test_strategy_delete_archives_but_preserves_history():
         assert connection.execute("SELECT archived_at FROM candidates WHERE id=?", (backtest["candidate_id"],)).fetchone()[0]
 
 
+def test_invalidated_backtest_cleanup_stops_active_forward_test():
+    completed = create_completed_session(); backtest = completed["backtests"][0]
+    created = client.post("/api/live-tests", json={"backtest_id": backtest["id"], "entitlement": "delayed", "delay_minutes": 15, "confirmation": "Start Live Data Test"}).json()
+    with service.connect() as connection:
+        connection.execute("UPDATE backtests SET invalidated_at=?,invalidation_reason='test' WHERE id=?", (service.iso(), backtest["id"]))
+        connection.execute("DELETE FROM app_metadata WHERE key='invalidated_execution_cleanup_v1'")
+    service.init_db()
+    assert client.get(f"/api/live-tests/{created['id']}").json()["state"] == "STOPPED"
+    assert client.delete(f"/api/strategies/{backtest['candidate_id']}").status_code == 200
+
+
 def test_strategy_delete_blocked_by_active_forward_test():
     completed = create_completed_session(); backtest = completed["backtests"][0]
     created = client.post("/api/live-tests", json={"backtest_id": backtest["id"], "entitlement": "delayed", "delay_minutes": 15, "confirmation": "Start Live Data Test"})
